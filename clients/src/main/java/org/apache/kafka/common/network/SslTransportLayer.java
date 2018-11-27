@@ -47,6 +47,7 @@ public class SslTransportLayer implements TransportLayer {
     private static final Logger log = LoggerFactory.getLogger(SslTransportLayer.class);
 
     private enum State {
+        NOT_INITALIZED,
         HANDSHAKE,
         HANDSHAKE_FAILED,
         READY,
@@ -65,12 +66,11 @@ public class SslTransportLayer implements TransportLayer {
     private ByteBuffer netReadBuffer;
     private ByteBuffer netWriteBuffer;
     private ByteBuffer appReadBuffer;
+    private boolean hasBytesBuffered;
     private ByteBuffer emptyBuf = ByteBuffer.allocate(0);
 
     public static SslTransportLayer create(String channelId, SelectionKey key, SSLEngine sslEngine) throws IOException {
-        SslTransportLayer transportLayer = new SslTransportLayer(channelId, key, sslEngine);
-        transportLayer.startHandshake();
-        return transportLayer;
+        return new SslTransportLayer(channelId, key, sslEngine);
     }
 
     // Prefer `create`, only use this in tests
@@ -79,11 +79,12 @@ public class SslTransportLayer implements TransportLayer {
         this.key = key;
         this.socketChannel = (SocketChannel) key.channel();
         this.sslEngine = sslEngine;
+        this.state = State.NOT_INITALIZED;
     }
 
     // Visible for testing
     protected void startHandshake() throws IOException {
-        if (state != null)
+        if (state != State.NOT_INITALIZED)
             throw new IllegalStateException("startHandshake() can only be called once, state " + state);
 
         this.netReadBuffer = ByteBuffer.allocate(netReadBufferSize());
@@ -151,11 +152,12 @@ public class SslTransportLayer implements TransportLayer {
     */
     @Override
     public void close() throws IOException {
+        State prevState = state;
         if (state == State.CLOSING) return;
         state = State.CLOSING;
         sslEngine.closeOutbound();
         try {
-            if (isConnected()) {
+            if (prevState != State.NOT_INITALIZED && isConnected()) {
                 if (!flush(netWriteBuffer)) {
                     throw new IOException("Remaining data in the network buffer, can't send SSL close message.");
                 }
@@ -176,6 +178,9 @@ public class SslTransportLayer implements TransportLayer {
         } finally {
             socketChannel.socket().close();
             socketChannel.close();
+            netReadBuffer = null;
+            netWriteBuffer = null;
+            appReadBuffer = null;
         }
     }
 
@@ -237,6 +242,8 @@ public class SslTransportLayer implements TransportLayer {
     */
     @Override
     public void handshake() throws IOException {
+        if (state == State.NOT_INITALIZED)
+            startHandshake();
         if (state == State.READY)
             throw renegotiationException();
         if (state == State.CLOSING)
@@ -501,13 +508,17 @@ public class SslTransportLayer implements TransportLayer {
             read = readFromAppBuffer(dst);
         }
 
+        boolean readFromNetwork = false;
         boolean isClosed = false;
         // Each loop reads at most once from the socket.
         while (dst.remaining() > 0) {
             int netread = 0;
             netReadBuffer = Utils.ensureCapacity(netReadBuffer, netReadBufferSize());
-            if (netReadBuffer.remaining() > 0)
+            if (netReadBuffer.remaining() > 0) {
                 netread = readFromSocketChannel();
+                if (netread > 0)
+                    readFromNetwork = true;
+            }
 
             while (netReadBuffer.position() > 0) {
                 netReadBuffer.flip();
@@ -561,6 +572,7 @@ public class SslTransportLayer implements TransportLayer {
             if (netread <= 0 || isClosed)
                 break;
         }
+        updateBytesBuffered(readFromNetwork || read > 0);
         // If data has been read and unwrapped, return the data even if end-of-stream, channel will be closed
         // on a subsequent poll.
         return read;
@@ -791,6 +803,11 @@ public class SslTransportLayer implements TransportLayer {
         return netReadBuffer;
     }
 
+    // Visibility for testing
+    protected ByteBuffer appReadBuffer() {
+        return appReadBuffer;
+    }
+
     /**
      * SSL exceptions are propagated as authentication failures so that clients can avoid
      * retries and report the failure. If `flush` is true, exceptions are propagated after
@@ -824,12 +841,22 @@ public class SslTransportLayer implements TransportLayer {
 
     @Override
     public boolean hasBytesBuffered() {
-        return netReadBuffer.position() != 0 || appReadBuffer.position() != 0;
+        return hasBytesBuffered;
+    }
+
+    // Update `hasBytesBuffered` status. If any bytes were read from the network or
+    // if data was returned from read, `hasBytesBuffered` is set to true if any buffered
+    // data is still remaining. If not, `hasBytesBuffered` is set to false since no progress
+    // can be made until more data is available to read from the network.
+    private void updateBytesBuffered(boolean madeProgress) {
+        if (madeProgress)
+            hasBytesBuffered = netReadBuffer.position() != 0 || appReadBuffer.position() != 0;
+        else
+            hasBytesBuffered = false;
     }
 
     @Override
     public long transferFrom(FileChannel fileChannel, long position, long count) throws IOException {
         return fileChannel.transferTo(position, count, this);
     }
-
 }

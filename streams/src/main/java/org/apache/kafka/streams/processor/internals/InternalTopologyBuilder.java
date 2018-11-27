@@ -122,7 +122,7 @@ public class InternalTopologyBuilder {
 
     private Map<Integer, Set<String>> nodeGroups = null;
 
-    interface StateStoreFactory {
+    public interface StateStoreFactory {
         Set<String> users();
         boolean loggingEnabled();
         StateStore build();
@@ -1878,9 +1878,15 @@ public class InternalTopologyBuilder {
 
     public void updateSubscribedTopics(final Set<String> topics, final String logPrefix) {
         final SubscriptionUpdates subscriptionUpdates = new SubscriptionUpdates();
-        log.debug("{}found {} topics possibly matching regex", topics, logPrefix);
+        log.debug("{}found {} topics possibly matching regex", logPrefix, topics);
         // update the topic groups with the returned subscription set for regex pattern subscriptions
         subscriptionUpdates.updateTopics(topics);
         updateSubscriptions(subscriptionUpdates, logPrefix);
+    }
+
+    // following functions are for test only
+
+    public synchronized Map<String, StateStoreFactory> getStateStores() {
+        return stateFactories;
     }
 }

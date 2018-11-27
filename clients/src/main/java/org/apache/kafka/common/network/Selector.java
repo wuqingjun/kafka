@@ -278,6 +278,8 @@ public class Selector implements Selectable, AutoCloseable {
         SelectionKey key = socketChannel.register(nioSelector, interestedOps);
         KafkaChannel channel = buildAndAttachKafkaChannel(socketChannel, id, key);
         this.channels.put(id, channel);
+        if (idleExpiryManager != null)
+            idleExpiryManager.update(channel.id(), time.nanoseconds());
         return key;
     }
 
@@ -498,7 +500,9 @@ public class Selector implements Selectable, AutoCloseable {
                     //this channel has bytes enqueued in intermediary buffers that we could not read
                     //(possibly because no memory). it may be the case that the underlying socket will
                     //not come up in the next poll() and so we need to remember this channel for the
-                    //next poll call otherwise data may be stuck in said buffers forever.
+                    //next poll call otherwise data may be stuck in said buffers forever. If we attempt
+                    //to process buffered data and no progress is made, the channel buffered status is
+                    //cleared to avoid the overhead of checking every time.
                     keysWithBufferedRead.add(key);
                 }
 
@@ -857,7 +861,7 @@ public class Selector implements Selectable, AutoCloseable {
     private void addToCompletedReceives(KafkaChannel channel, Deque<NetworkReceive> stagedDeque) {
         NetworkReceive networkReceive = stagedDeque.poll();
         this.completedReceives.add(networkReceive);
-        this.sensors.recordBytesReceived(channel.id(), networkReceive.payload().limit());
+        this.sensors.recordBytesReceived(channel.id(), networkReceive.size());
     }
 
     // only for testing
