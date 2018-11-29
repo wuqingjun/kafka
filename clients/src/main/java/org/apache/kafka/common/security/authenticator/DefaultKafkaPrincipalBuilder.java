@@ -117,12 +117,12 @@ public class DefaultKafkaPrincipalBuilder implements KafkaPrincipalBuilder, Clos
         } else if (context instanceof SaslAuthenticationContext) {
             SaslServer saslServer = ((SaslAuthenticationContext) context).server();
             if (SaslConfigs.GSSAPI_MECHANISM.equals(saslServer.getMechanismName()))
-                return applyKerberosShortNamer(saslServer.getAuthorizationID());
-            else
-                return new KafkaPrincipal(KafkaPrincipal.USER_TYPE, saslServer.getAuthorizationID());
-        } else {
-            throw new IllegalArgumentException("Unhandled authentication context type: " + context.getClass().getName());
-        }
+            return applyKerberosShortNamer(saslServer.getAuthorizationID());
+        else
+            return new KafkaPrincipal(KafkaPrincipal.USER_TYPE, saslServer.getAuthorizationID());
+    } else {
+        throw new IllegalArgumentException("Unhandled authentication context type: " + context.getClass().getName());
+    }
     }
 
     private KafkaPrincipal applyKerberosShortNamer(String authorizationId) {

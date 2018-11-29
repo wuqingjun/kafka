@@ -34,5 +34,17 @@ IF ["%KAFKA_HEAP_OPTS%"] EQU [""] (
         set KAFKA_HEAP_OPTS=-Xmx1G -Xms1G
     )
 )
+
+
+
+SET KAFKA_OPTS=%KAFKA_OPTS% -Djava.security.auth.login.config=%~dp0../../config/kafka_server_jaas.conf
+REM SET KAFKA_OPTS=%KAFKA_OPTS% -Ddsts.serviceDnsName=co2agg04-dsts-aware-service.core.windows-tst.net
+REM SET KAFKA_OPTS=%KAFKA_OPTS% -Ddsts.serviceName=ZooKeeperServiceTest
+REM SET KAFKA_OPTS=%KAFKA_OPTS% -Ddsts.dstsRealm=realm://dsts.core.azure-test.net/ 
+REM SET KAFKA_OPTS=%KAFKA_OPTS% -Ddsts.dstsDnsName=co2agg04-dsts.dsts.core.azure-test.net 
+REM SET KAFKA_OPTS=%KAFKA_OPTS% -Ddsts.authenticationJ4nLibrary=DstsAuthentication.j4n.dll 
+REM SET KAFKA_OPTS=%KAFKA_OPTS% -Dlog4j.configuration=\github\kafka\config\log4j.properties 
+
+
 "%~dp0kafka-run-class.bat" kafka.Kafka %*
 EndLocal
