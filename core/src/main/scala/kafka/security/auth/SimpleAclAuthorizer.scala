@@ -24,6 +24,7 @@ import com.typesafe.scalalogging.Logger
 import kafka.common.{NotificationHandler, ZkNodeChangeNotificationListener}
 import kafka.network.RequestChannel.Session
 import kafka.security.auth.SimpleAclAuthorizer.{NoAcls, VersionedAcls}
+import kafka.server.DynamicConfig.User
 import kafka.server.KafkaConfig
 import kafka.utils.CoreUtils.{inReadLock, inWriteLock}
 import kafka.utils._
@@ -105,7 +106,8 @@ class SimpleAclAuthorizer extends Authorizer with Logging {
   }
 
   override def authorize(session: Session, operation: Operation, resource: Resource): Boolean = {
-    val rincipal = session.principal
+    /*
+    val principal = session.principal
     val host = session.clientAddress.getHostAddress
     val acls = getAcls(resource) ++ getAcls(new Resource(resource.resourceType, Resource.WildCardResource))
 
@@ -130,6 +132,17 @@ class SimpleAclAuthorizer extends Authorizer with Logging {
 
     logAuditMessage(principal, authorized, operation, resource, host)
     authorized
+   */
+    resource.resourceType match {
+      case Topic => {
+        val acls = getAcls(resource) ++ getAcls(new Resource(resource.resourceType, Resource.WildCardResource))
+        session.principal.getPrincipalType match {
+          case "User" => aclMatch(operation, resource, session.principal, session.clientAddress.getHostAddress, Allow, acls)
+          case _ => true
+        }
+      }
+      case _ => true
+    }
   }
 
   def isEmptyAclAndAuthorized(operation: Operation, resource: Resource, principal: KafkaPrincipal, host: String, acls: Set[Acl]): Boolean = {
