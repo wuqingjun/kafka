@@ -137,7 +137,12 @@ class SimpleAclAuthorizer extends Authorizer with Logging {
       case Topic => {
         val acls = getAcls(resource) ++ getAcls(new Resource(resource.resourceType, Resource.WildCardResource))
         session.principal.getPrincipalType match {
-          case "User" => aclMatch(operation, resource, session.principal, session.clientAddress.getHostAddress, Allow, acls)
+          case "User" => {
+            authorizerLogger.info("Authorizing user: {}", session.principal.getName)
+            val res = aclMatch(operation, resource, session.principal, session.clientAddress.getHostAddress, Allow, acls)
+            authorizerLogger.info("Authorization result: {}", res)
+            res
+          }
           case _ => true
         }
       }
