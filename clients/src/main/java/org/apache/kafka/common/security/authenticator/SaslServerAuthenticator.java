@@ -298,9 +298,16 @@ public class SaslServerAuthenticator implements Authenticator {
     public KafkaPrincipal principal() {
         SaslAuthenticationContext context = new SaslAuthenticationContext(saslServer, securityProtocol, clientAddress());
         KafkaPrincipal principal = principalBuilder.build(context);
-        if (ScramMechanism.isScram(saslMechanism) && Boolean.parseBoolean((String) saslServer.getNegotiatedProperty(ScramLoginModule.TOKEN_AUTH_CONFIG))) {
+        if (ScramMechanism.isScram(saslMechanism)) {
+            if (Boolean.parseBoolean((String) saslServer.getNegotiatedProperty(ScramLoginModule.TOKEN_AUTH_CONFIG))) {
+                principal.tokenAuthenticated(true);
+            }
+        }
+
+        if(saslMechanism.equals("PLAIN")){
             principal.tokenAuthenticated(true);
         }
+
         return principal;
     }
 
