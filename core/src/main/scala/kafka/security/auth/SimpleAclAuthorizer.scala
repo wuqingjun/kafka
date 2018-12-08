@@ -139,12 +139,9 @@ class SimpleAclAuthorizer extends Authorizer with Logging {
         session.principal.getPrincipalType match {
           case "User" => {
             authorizerLogger.info("Authorizing user: {}", session.principal.getName)
-            if(session.principal.getName.equals(KafkaPrincipal.ANONYMOUS.getName)) true
-            else {
-              val res = aclMatch(operation, resource, session.principal, session.clientAddress.getHostAddress, Allow, acls)
-              authorizerLogger.info("Authorization result: {}", res)
-              res
-            }
+            val res = aclMatch(operation, resource, session.principal, session.clientAddress.getHostAddress, Allow, acls)
+            authorizerLogger.info("Authorization result: {}", res)
+            res
           }
           case _ => true
         }
