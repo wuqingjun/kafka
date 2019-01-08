@@ -39,7 +39,18 @@ import net.sf.jni4net.Bridge;
 import dstsauthentication.DstsAuthentication;
 import dstsauthentication.AuthenticationResult;
 import dstsauthentication.Claim;
-
+import org.apache.zookeeper.AsyncCallback.*;//{ACLCallback, Children2Callback, DataCallback, StatCallback, StringCallback, VoidCallback}
+import org.apache.zookeeper.KeeperException.Code;
+import org.apache.zookeeper.Watcher.Event.*;//{EventType, KeeperState}
+import org.apache.zookeeper.ZooKeeper.States;
+import org.apache.zookeeper.data.*;//{ACL, Stat}
+import org.apache.zookeeper.*;//{CreateMode, KeeperException, WatchedEvent, Watcher, ZooKeeper}
+import org.apache.zookeeper.ZooKeeper;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.Watcher.Event.KeeperState;
+import org.apache.zookeeper.data.Stat;
 
 /**
  * Simple SaslServer implementation for SASL/PLAIN. In order to make this implementation
@@ -70,12 +81,14 @@ public class PlainSaslServer implements SaslServer {
     public static final String AUTHENTICATION_STATUS_OK="OK";
 
     private final JaasContext jaasContext;
+    private final Map<String, ?> props;
 
     private boolean complete;
     private String authorizationId;
 
-    public PlainSaslServer(JaasContext jaasContext) {
+    public PlainSaslServer(JaasContext jaasContext, Map<String, ?> props) {
         this.jaasContext = jaasContext;
+        this.props = props;
     }
 
     /**
@@ -134,9 +147,22 @@ public class PlainSaslServer implements SaslServer {
         String j4nLibFilePath = LIB_PATH + "/" + System.getProperty(DSTS_AUTHENTICATION_J4N_LIBRARY);
 
         try {
+            ZooKeeper zk = new ZooKeeper(props.get("zookeeper.connect").toString(), Integer.parseInt(props.get("zookeeper.session.timeout.ms").toString()), new Watcher(){
+                public void process(WatchedEvent watchedEvent){
+                    log.info("Event state: {}", watchedEvent.getState());
+                }
+            });
+
+            byte[] bn = zk.getData("/AzPubSubRegistrar/DstsMetadata", false, null);
+
+            String dstsDns = new String(bn,
+                    "UTF-8");
+            zk.close();
+
             Bridge.init(new File(LIB_PATH));
             Bridge.LoadAndRegisterAssemblyFrom(new java.io.File(j4nLibFilePath));
             DstsAuthentication authentication = new DstsAuthentication();
+
             AuthenticationResult res = authentication.Authenticate(System.getProperty(DSTS_DSTSREALM),
                     System.getProperty(DSTS_DSTSDNSNAME),
                     System.getProperty(DSTS_SERVICEDNSNAME),
@@ -238,7 +264,7 @@ public class PlainSaslServer implements SaslServer {
             if (!(cbh instanceof SaslServerCallbackHandler))
                 throw new SaslException("CallbackHandler must be of type SaslServerCallbackHandler, but it is: " + cbh.getClass());
 
-            return new PlainSaslServer(((SaslServerCallbackHandler) cbh).jaasContext());
+            return new PlainSaslServer(((SaslServerCallbackHandler) cbh).jaasContext(), props);
         }
 
         @Override
