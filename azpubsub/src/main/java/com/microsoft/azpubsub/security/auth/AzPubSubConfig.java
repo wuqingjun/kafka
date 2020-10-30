@@ -42,6 +42,16 @@ public class AzPubSubConfig extends AbstractConfig {
                                         "", 
                                         Importance.MEDIUM,
                                         DSTS_METADATA_FILE_DOC)
+                                .define("azpubsub.topic.max.qps",
+                                        Type.INT,
+                                        1000,
+                                        Importance.MEDIUM,
+                                        "Topic Qps")
+                                .define("azpubsub.enable.topic.qps.throttling",
+                                        Type.BOOLEAN,
+                                        true,
+                                        Importance.MEDIUM,
+                                       "Topic Qps throttling enabled")
                                 ;
     }
 
