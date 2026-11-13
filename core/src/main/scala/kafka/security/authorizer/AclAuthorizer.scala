@@ -48,6 +48,7 @@ import scala.jdk.CollectionConverters._
 import scala.util.{Failure, Random, Success, Try}
 
 object AclAuthorizer {
+
   // Optional override zookeeper cluster configuration where acls will be stored. If not specified,
   // acls will be stored in the same zookeeper where all other kafka broker metadata is stored.
   val configPrefix: String = "authorizer."
@@ -354,15 +355,14 @@ class AclAuthorizer extends Authorizer with Logging {
                                        resourceType: ResourceType): AuthorizationResult = {
     SecurityUtils.authorizeByResourceTypeCheckArgs(op, resourceType)
 
-    val principal = new KafkaPrincipal(
-      requestContext.principal().getPrincipalType,
-      requestContext.principal().getName)
+    // All identities of the principal (one for a plain principal); ACLs of any of them count.
+    val principals = aclPrincipals(requestContext.principal())
 
-    if (isSuperUser(principal))
+    if (isSuperUser(principals))
       return AuthorizationResult.ALLOWED
 
     val resourceSnapshot = resourceCache
-    val principalStr = principal.toString
+    val principalStr = principals.map(_.toString)
     val host = requestContext.clientAddress().getHostAddress
     val action = new Action(op, new ResourcePattern(resourceType, "NONE", PatternType.UNKNOWN), 0, true, true)
 
@@ -408,10 +408,10 @@ class AclAuthorizer extends Authorizer with Logging {
   }
 
   private def matchingResources(resourceSnapshot: immutable.Map[ResourceTypeKey, immutable.Set[String]],
-                                principal: String, host: String, op: AclOperation, permission: AclPermissionType,
+                                principals: Set[String], host: String, op: AclOperation, permission: AclPermissionType,
                                 resourceType: ResourceType, patternType: PatternType): ArrayBuffer[Set[String]] = {
     val matched = ArrayBuffer[immutable.Set[String]]()
-    for (p <- Set(principal, AclEntry.WILDCARD_PRINCIPAL_STRING);
+    for (p <- principals + AclEntry.WILDCARD_PRINCIPAL_STRING;
          h <- Set(host, AclEntry.WILDCARD_HOST);
          o <- Set(op, AclOperation.ALL)) {
       val resourceTypeKey = ResourceTypeKey(
@@ -425,9 +425,9 @@ class AclAuthorizer extends Authorizer with Logging {
   }
 
   private def hasMatchingResources(resourceSnapshot: immutable.Map[ResourceTypeKey, immutable.Set[String]],
-                                   principal: String, host: String, op: AclOperation, permission: AclPermissionType,
+                                   principals: Set[String], host: String, op: AclOperation, permission: AclPermissionType,
                                    resourceType: ResourceType, patternType: PatternType): Boolean = {
-    for (p <- Set(principal, AclEntry.WILDCARD_PRINCIPAL_STRING);
+    for (p <- principals + AclEntry.WILDCARD_PRINCIPAL_STRING;
          h <- Set(host, AclEntry.WILDCARD_HOST);
          o <- Set(op, AclOperation.ALL)) {
           val resourceTypeKey = ResourceTypeKey(
@@ -478,12 +478,8 @@ class AclAuthorizer extends Authorizer with Logging {
       throw new IllegalArgumentException("Only literal resources are supported. Got: " + resource.patternType)
     }
 
-    // ensure we compare identical classes
-    val sessionPrincipal = requestContext.principal
-    val principal = if (classOf[KafkaPrincipal] != sessionPrincipal.getClass)
-      new KafkaPrincipal(sessionPrincipal.getPrincipalType, sessionPrincipal.getName)
-    else
-      sessionPrincipal
+    // All identities of the principal as plain KafkaPrincipals (one for a plain principal); ACLs of any of them count.
+    val principals = aclPrincipals(requestContext.principal)
 
     val host = requestContext.clientAddress.getHostAddress
     val operation = action.operation
@@ -498,7 +494,7 @@ class AclAuthorizer extends Authorizer with Logging {
 
     def denyAclExists(acls: AclSeqs): Boolean = {
       // Check if there are any Deny ACLs which would forbid this operation.
-      matchingAclExists(operation, resource, principal, host, DENY, acls)
+      matchingAclExists(operation, resource, principals, host, DENY, acls)
     }
 
     def allowAclExists(acls: AclSeqs): Boolean = {
@@ -510,7 +506,7 @@ class AclAuthorizer extends Authorizer with Logging {
         case DESCRIBE_CONFIGS => Set[AclOperation](DESCRIBE_CONFIGS, ALTER_CONFIGS)
         case _ => Set[AclOperation](operation)
       }
-      allowOps.exists(operation => matchingAclExists(operation, resource, principal, host, ALLOW, acls))
+      allowOps.exists(operation => matchingAclExists(operation, resource, principals, host, ALLOW, acls))
     }
 
     def aclsAllowAccess = {
@@ -521,17 +517,36 @@ class AclAuthorizer extends Authorizer with Logging {
     }
 
     // Evaluate if operation is allowed
-    val authorized = isSuperUser(principal) || aclsAllowAccess
+    val authorized = isSuperUser(principals) || aclsAllowAccess
 
     logAuditMessage(requestContext, action, authorized)
     if (authorized) AuthorizationResult.ALLOWED else AuthorizationResult.DENIED
   }
 
-  private def isSuperUser(principal: KafkaPrincipal): Boolean = {
-    if (superUsers.contains(principal)) {
-      authorizerLogger.debug(s"principal = $principal is a super user, allowing operation without checking acls.")
-      true
-    } else false
+  /**
+   * Extension point: the principals whose ACLs (and super.users entries) apply to a request, as plain
+   * KafkaPrincipals so they compare equal to ACL entries. A request is allowed if any of them has a matching ALLOW
+   * ACL and none has a matching DENY ACL.
+   * Default: just the session principal (a KafkaPrincipal subclass is reduced to type:name), i.e. the original
+   * single-principal behavior. Subclasses (e.g. MultiIdentityAclAuthorizer) may return additional identities.
+   */
+  protected[authorizer] def aclPrincipals(sessionPrincipal: KafkaPrincipal): Set[KafkaPrincipal] =
+    if (sessionPrincipal.getClass != classOf[KafkaPrincipal])
+      Set(new KafkaPrincipal(sessionPrincipal.getPrincipalType, sessionPrincipal.getName))
+    else
+      Set(sessionPrincipal)
+
+  /** Extension point: how the principal is shown in the audit log. Default: principal.toString (type:name). */
+  protected[authorizer] def auditPrincipal(sessionPrincipal: KafkaPrincipal): String = sessionPrincipal.toString
+
+  /** Super user if any of the principal's identities is listed in super.users. */
+  private def isSuperUser(principals: Set[KafkaPrincipal]): Boolean = {
+    principals.find(superUsers.contains) match {
+      case Some(principal) =>
+        authorizerLogger.debug(s"principal = $principal is a super user, allowing operation without checking acls.")
+        true
+      case None => false
+    }
   }
 
   @nowarn("cat=deprecation")
@@ -561,13 +576,13 @@ class AclAuthorizer extends Authorizer with Logging {
 
   private def matchingAclExists(operation: AclOperation,
                                 resource: ResourcePattern,
-                                principal: KafkaPrincipal,
+                                principals: Set[KafkaPrincipal],
                                 host: String,
                                 permissionType: AclPermissionType,
                                 acls: AclSeqs): Boolean = {
     acls.find { acl =>
       acl.permissionType == permissionType &&
-        (acl.kafkaPrincipal == principal || acl.kafkaPrincipal == AclEntry.WILDCARD_PRINCIPAL) &&
+        (principals.contains(acl.kafkaPrincipal) || acl.kafkaPrincipal == AclEntry.WILDCARD_PRINCIPAL) &&
         (operation == acl.operation || acl.operation == AclOperation.ALL) &&
         (acl.host == host || acl.host == AclEntry.WILDCARD_HOST)
     }.exists { acl =>
@@ -600,7 +615,7 @@ class AclAuthorizer extends Authorizer with Logging {
 
   private def logAuditMessage(requestContext: AuthorizableRequestContext, action: Action, authorized: Boolean): Unit = {
     def logMessage: String = {
-      val principal = requestContext.principal
+      val principal = auditPrincipal(requestContext.principal)
       val operation = SecurityUtils.operationName(action.operation)
       val host = requestContext.clientAddress.getHostAddress
       val resourceType = SecurityUtils.resourceTypeName(action.resourcePattern.resourceType)
