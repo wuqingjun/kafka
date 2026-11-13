@@ -1,0 +1,220 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements. See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License. You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package kafka.security.authorizer
+
+import kafka.server.{KafkaConfig, QuorumTestHarness}
+import kafka.utils.TestUtils
+import org.apache.kafka.common.acl.AclOperation.{DESCRIBE, READ, WRITE}
+import org.apache.kafka.common.acl.AclPermissionType.{ALLOW, DENY}
+import org.apache.kafka.common.acl.{AccessControlEntry, AccessControlEntryFilter, AclBinding, AclBindingFilter, AclOperation}
+import org.apache.kafka.common.network.{ClientInformation, ListenerName}
+import org.apache.kafka.common.protocol.ApiKeys
+import org.apache.kafka.common.requests.{RequestContext, RequestHeader}
+import org.apache.kafka.common.resource.PatternType.{LITERAL, PREFIXED}
+import org.apache.kafka.common.resource.ResourcePattern.WILDCARD_RESOURCE
+import org.apache.kafka.common.resource.ResourceType.{GROUP, TOPIC}
+import org.apache.kafka.common.resource.{ResourcePattern, ResourceType}
+import org.apache.kafka.common.security.auth.{KafkaPrincipal, MultiIdentityPrincipal, SecurityProtocol}
+import org.apache.kafka.security.authorizer.AclEntry.WILDCARD_HOST
+import org.apache.kafka.server.authorizer.{Action, AuthorizationResult}
+import org.junit.jupiter.api.Assertions.{assertEquals, assertFalse, assertTrue}
+import org.junit.jupiter.api.{AfterEach, BeforeEach, Test, TestInfo}
+
+import java.net.InetAddress
+import java.util.{Collections, UUID}
+import scala.jdk.CollectionConverters._
+
+/**
+ * MultiIdentityAclAuthorizer with MultiIdentityPrincipal: ACLs on any identity (subject or claim) apply.
+ * Also checks that the built-in AclAuthorizer keeps its single-principal behavior. ZooKeeper mode.
+ */
+class AclAuthorizerMultiIdentityTest extends QuorumTestHarness {
+
+  private val host = InetAddress.getByName("192.168.0.1")
+  private val adminContext = context(new KafkaPrincipal("User", "superuser"))
+  private var authorizer: MultiIdentityAclAuthorizer = _
+  private var builtIn: AclAuthorizer = _
+  private var topic: ResourcePattern = _
+
+  @BeforeEach
+  override def setUp(testInfo: TestInfo): Unit = {
+    super.setUp(testInfo)
+    val props = TestUtils.createBrokerConfig(0, zkConnect)
+    props.put(AclAuthorizer.SuperUsersProp, "User:superuser;Claim:kafka-admins")
+    val configs = KafkaConfig.fromProps(props).originals
+    authorizer = new MultiIdentityAclAuthorizer
+    authorizer.configure(configs)
+    authorizer.maxUpdateRetries = Int.MaxValue
+    builtIn = new AclAuthorizer
+    builtIn.configure(configs)
+    topic = new ResourcePattern(TOPIC, "orders-" + UUID.randomUUID(), LITERAL)
+  }
+
+  @AfterEach
+  override def tearDown(): Unit = {
+    authorizer.close()
+    builtIn.close()
+    TestUtils.clearYammerMetrics()
+    super.tearDown()
+  }
+
+  private def token(subject: String, claims: String*): MultiIdentityPrincipal =
+    new MultiIdentityPrincipal("User", subject, MultiIdentityPrincipal.Source.TOKEN, claims.asJava)
+
+  private def context(principal: KafkaPrincipal): RequestContext = {
+    val header = new RequestHeader(ApiKeys.PRODUCE, 2, "", 1)
+    new RequestContext(header, "", host, principal, ListenerName.forSecurityProtocol(SecurityProtocol.SASL_SSL),
+      SecurityProtocol.SASL_SSL, ClientInformation.EMPTY, false)
+  }
+
+  private def ace(principal: String, op: AclOperation, permission: org.apache.kafka.common.acl.AclPermissionType) =
+    new AccessControlEntry(principal, WILDCARD_HOST, op, permission)
+
+  private def addAcls(resource: ResourcePattern, aces: AccessControlEntry*): Unit = {
+    authorizer.createAcls(adminContext, aces.map(new AclBinding(resource, _)).asJava).asScala
+      .map(_.toCompletableFuture.get)
+      .foreach(result => result.exception.ifPresent(e => throw e))
+  }
+
+  private def allowed(principal: KafkaPrincipal, op: AclOperation, resource: ResourcePattern): Boolean = {
+    val action = new Action(op, resource, 1, true, true)
+    authorizer.authorize(context(principal), Collections.singletonList(action)).get(0) == AuthorizationResult.ALLOWED
+  }
+
+  private def allowedByType(principal: KafkaPrincipal, op: AclOperation, resourceType: ResourceType): Boolean =
+    authorizer.authorizeByResourceType(context(principal), op, resourceType) == AuthorizationResult.ALLOWED
+
+  @Test
+  def testClaimAclAllowsAnyTokenWithThatClaim(): Unit = {
+    addAcls(topic, ace("Claim:kafka-readers", READ, ALLOW))
+
+    assertTrue(allowed(token("alice@example.com", "payments-team", "kafka-readers"), READ, topic))
+    assertTrue(allowed(token("bob@example.com", "kafka-readers"), READ, topic))
+    assertFalse(allowed(token("carol@example.com", "payments-team"), READ, topic), "claim not present")
+    assertFalse(allowed(token("alice@example.com", "kafka-readers"), WRITE, topic), "only READ granted")
+  }
+
+  @Test
+  def testClaimTypeIsSeparateFromUserType(): Unit = {
+    addAcls(topic, ace("Claim:kafka-readers", READ, ALLOW))
+    // A user (or token subject) named like the claim does not match a Claim ACL
+    assertFalse(allowed(new KafkaPrincipal("User", "kafka-readers"), READ, topic))
+    assertFalse(allowed(token("kafka-readers"), READ, topic))
+  }
+
+  @Test
+  def testSubjectAclStillWorks(): Unit = {
+    addAcls(topic, ace("User:alice@example.com", WRITE, ALLOW))
+    assertTrue(allowed(token("alice@example.com", "kafka-readers"), WRITE, topic))
+    assertFalse(allowed(token("bob@example.com", "kafka-readers"), WRITE, topic))
+  }
+
+  @Test
+  def testDenyOnAnyClaimWins(): Unit = {
+    addAcls(topic, ace("Claim:kafka-readers", READ, ALLOW), ace("Claim:contractors", READ, DENY))
+    assertTrue(allowed(token("alice@example.com", "kafka-readers"), READ, topic))
+    assertFalse(allowed(token("dave@example.com", "kafka-readers", "contractors"), READ, topic))
+  }
+
+  @Test
+  def testDenyOnSubjectWinsOverClaimAllow(): Unit = {
+    addAcls(topic, ace("Claim:kafka-readers", READ, ALLOW), ace("User:mallory@example.com", READ, DENY))
+    assertFalse(allowed(token("mallory@example.com", "kafka-readers"), READ, topic))
+  }
+
+  @Test
+  def testReadOnClaimImpliesDescribe(): Unit = {
+    addAcls(topic, ace("Claim:kafka-readers", READ, ALLOW))
+    assertTrue(allowed(token("alice@example.com", "kafka-readers"), DESCRIBE, topic))
+  }
+
+  @Test
+  def testPrefixedAndGroupAclsOnClaims(): Unit = {
+    val prefix = "payments-" + UUID.randomUUID()
+    addAcls(new ResourcePattern(TOPIC, prefix, PREFIXED), ace("Claim:payments-team", WRITE, ALLOW))
+    addAcls(new ResourcePattern(GROUP, WILDCARD_RESOURCE, LITERAL), ace("Claim:payments-team", READ, ALLOW))
+
+    val alice = token("alice@example.com", "payments-team")
+    assertTrue(allowed(alice, WRITE, new ResourcePattern(TOPIC, prefix + "-events", LITERAL)))
+    assertFalse(allowed(alice, WRITE, new ResourcePattern(TOPIC, "other-" + UUID.randomUUID(), LITERAL)))
+    assertTrue(allowed(alice, READ, new ResourcePattern(GROUP, "any-group", LITERAL)))
+  }
+
+  @Test
+  def testSuperUserByClaim(): Unit = {
+    assertTrue(allowed(token("admin@example.com", "kafka-admins"), WRITE, topic))
+    assertFalse(allowed(token("alice@example.com", "kafka-readers"), WRITE, topic))
+  }
+
+  @Test
+  def testAuthorizeByResourceTypeUsesClaims(): Unit = {
+    // Idempotent producers are authorized as "WRITE on any topic"
+    addAcls(topic, ace("Claim:kafka-writers", WRITE, ALLOW))
+    assertTrue(allowedByType(token("alice@example.com", "kafka-writers"), WRITE, TOPIC))
+    assertFalse(allowedByType(token("bob@example.com", "kafka-readers"), WRITE, TOPIC))
+
+    // A wildcard DENY on another claim of the same token wins
+    addAcls(new ResourcePattern(TOPIC, WILDCARD_RESOURCE, LITERAL), ace("Claim:blocked", WRITE, DENY))
+    assertFalse(allowedByType(token("eve@example.com", "kafka-writers", "blocked"), WRITE, TOPIC))
+    assertTrue(allowedByType(token("alice@example.com", "kafka-writers"), WRITE, TOPIC))
+  }
+
+  @Test
+  def testSuperUserByClaimForResourceType(): Unit = {
+    assertTrue(allowedByType(token("admin@example.com", "kafka-admins"), WRITE, TOPIC))
+  }
+
+  @Test
+  def testPlainPrincipalsUnchanged(): Unit = {
+    addAcls(topic, ace("User:bob", READ, ALLOW))
+    assertTrue(allowed(new KafkaPrincipal("User", "bob"), READ, topic))
+    assertFalse(allowed(new KafkaPrincipal("User", "carol"), READ, topic))
+    assertTrue(allowed(new KafkaPrincipal("User", "superuser"), WRITE, topic))
+  }
+
+  @Test
+  def testAclPrincipals(): Unit = {
+    assertEquals(Set(new KafkaPrincipal("User", "alice"), new KafkaPrincipal("Claim", "a"), new KafkaPrincipal("Claim", "b")),
+      authorizer.aclPrincipals(token("alice", "a", "b")))
+    assertEquals(Set(new KafkaPrincipal("User", "bob")), authorizer.aclPrincipals(new KafkaPrincipal("User", "bob")))
+    // built-in: only type:name, as before
+    assertEquals(Set(new KafkaPrincipal("User", "alice")), builtIn.aclPrincipals(token("alice", "a", "b")))
+  }
+
+  @Test
+  def testAuditPrincipal(): Unit = {
+    assertEquals("User:alice (TOKEN, 2 identities)", authorizer.auditPrincipal(token("alice", "a", "b")))
+    assertEquals("User:alice", builtIn.auditPrincipal(token("alice", "a", "b")))
+  }
+
+  @Test
+  def testBuiltInAclAuthorizerIgnoresClaims(): Unit = {
+    addAcls(topic, ace("Claim:kafka-readers", READ, ALLOW), ace("User:alice@example.com", WRITE, ALLOW))
+    // Wait until the built-in authorizer instance has seen the ACLs (shared ZooKeeper, separate cache)
+    TestUtils.waitUntilTrue(() => builtIn.acls(new AclBindingFilter(topic.toFilter, AccessControlEntryFilter.ANY)).asScala.size == 2,
+      "built-in authorizer did not receive the ACLs")
+    val alice = token("alice@example.com", "kafka-readers")
+    val ctx = context(alice)
+    def builtInAllowed(op: AclOperation) =
+      builtIn.authorize(ctx, Collections.singletonList(new Action(op, topic, 1, true, true))).get(0) == AuthorizationResult.ALLOWED
+
+    assertFalse(builtInAllowed(READ), "built-in AclAuthorizer must not use claims")
+    assertTrue(builtInAllowed(WRITE), "built-in AclAuthorizer still matches the subject")
+    assertFalse(builtIn.authorizeByResourceType(context(token("x", "kafka-admins")), WRITE, TOPIC) == AuthorizationResult.ALLOWED,
+      "built-in AclAuthorizer must not treat Claim:kafka-admins as super user")
+  }
+}
