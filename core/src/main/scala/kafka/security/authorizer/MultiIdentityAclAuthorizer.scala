@@ -16,8 +16,12 @@
  */
 package kafka.security.authorizer
 
+import org.apache.kafka.common.config.ConfigException
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, MultiIdentityPrincipal}
+import org.apache.kafka.common.security.authenticator.{DefaultSuperUsersValidator, SuperUsersValidationIssue, SuperUsersValidator}
+import org.apache.kafka.common.utils.Utils
 
+import java.util
 import scala.jdk.CollectionConverters._
 
 /**
@@ -36,8 +40,45 @@ import scala.jdk.CollectionConverters._
  * }}}
  * Without these settings (`authorizer.class.name=kafka.security.authorizer.AclAuthorizer`), the built-in authorizer
  * ignores the extra identities and only matches `User:<subject>`.
+ *
+ * At startup `super.users` is validated by a [[SuperUsersValidator]] (`authorizer.super.users.validation.class`,
+ * default [[DefaultSuperUsersValidator]]). Every issue is logged; any ERROR stops the broker from starting.
  */
 class MultiIdentityAclAuthorizer extends AclAuthorizer {
+
+  override def configure(javaConfigs: util.Map[String, _]): Unit = {
+    validateSuperUsers(javaConfigs)
+    super.configure(javaConfigs)
+  }
+
+  private def validateSuperUsers(configs: util.Map[String, _]): Unit = {
+    val className = Option(configs.get(SuperUsersValidator.VALIDATOR_CLASS_CONFIG)).map(_.toString.trim)
+      .filter(_.nonEmpty).getOrElse(classOf[DefaultSuperUsersValidator].getName)
+    val validator = try {
+      Utils.newInstance(className, classOf[SuperUsersValidator])
+    } catch {
+      case _: ClassNotFoundException =>
+        throw new ConfigException(SuperUsersValidator.VALIDATOR_CLASS_CONFIG, className, "class not found on the broker classpath")
+    }
+    validator.configure(configs)
+
+    // Same split as AclAuthorizer.configure (a trailing ';' is ignored; an empty entry in the middle is reported)
+    val entries = Option(configs.get(AclAuthorizer.SuperUsersProp)).map(_.toString).filter(_.nonEmpty)
+      .map(_.split(";").map(_.trim).toList).getOrElse(Nil)
+    val issues = validator.validate(entries.asJava).asScala.toList
+
+    issues.foreach { issue =>
+      issue.severity match {
+        case SuperUsersValidationIssue.Severity.ERROR => error(issue.toString)
+        case SuperUsersValidationIssue.Severity.WARNING => warn(issue.toString)
+        case SuperUsersValidationIssue.Severity.INFO => info(issue.toString)
+      }
+    }
+    val errors = issues.filter(_.severity == SuperUsersValidationIssue.Severity.ERROR)
+    if (errors.nonEmpty)
+      throw new ConfigException(s"Invalid ${AclAuthorizer.SuperUsersProp} (validated by $className): " +
+        errors.map(_.toString).mkString(" | "))
+  }
 
   override protected[authorizer] def aclPrincipals(sessionPrincipal: KafkaPrincipal): Set[KafkaPrincipal] =
     sessionPrincipal match {
