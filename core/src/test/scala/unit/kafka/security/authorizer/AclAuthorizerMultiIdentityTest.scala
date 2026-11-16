@@ -18,7 +18,7 @@ package kafka.security.authorizer
 
 import kafka.server.{KafkaConfig, QuorumTestHarness}
 import kafka.utils.TestUtils
-import org.apache.kafka.common.acl.AclOperation.{DESCRIBE, READ, WRITE}
+import org.apache.kafka.common.acl.AclOperation.{ALTER_CONFIGS, DESCRIBE, DESCRIBE_CONFIGS, READ, WRITE}
 import org.apache.kafka.common.acl.AclPermissionType.{ALLOW, DENY}
 import org.apache.kafka.common.acl.{AccessControlEntry, AccessControlEntryFilter, AclBinding, AclBindingFilter, AclOperation}
 import org.apache.kafka.common.config.ConfigException
@@ -28,8 +28,8 @@ import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.requests.{RequestContext, RequestHeader}
 import org.apache.kafka.common.resource.PatternType.{LITERAL, PREFIXED}
 import org.apache.kafka.common.resource.ResourcePattern.WILDCARD_RESOURCE
-import org.apache.kafka.common.resource.ResourceType.{GROUP, TOPIC}
-import org.apache.kafka.common.resource.{ResourcePattern, ResourceType}
+import org.apache.kafka.common.resource.ResourceType.{CLUSTER, GROUP, TOPIC}
+import org.apache.kafka.common.resource.{Resource, ResourcePattern, ResourceType}
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, MultiIdentityPrincipal, SecurityProtocol}
 import org.apache.kafka.common.security.authenticator.{SuperUsersValidationIssue, SuperUsersValidator}
 import org.apache.kafka.security.authorizer.AclEntry.WILDCARD_HOST
@@ -308,6 +308,54 @@ class AclAuthorizerMultiIdentityTest extends QuorumTestHarness {
     // default (not set): changes allowed, as before
     addAcls(topic, ace("User:alice@example.com", WRITE, ALLOW))
     assertTrue(allowed(new KafkaPrincipal("User", "alice@example.com"), WRITE, topic))
+  }
+
+  private def contextFor(principal: KafkaPrincipal, apiKey: ApiKeys): RequestContext = {
+    val header = new RequestHeader(apiKey, apiKey.latestVersion, "", 1)
+    new RequestContext(header, "", host, principal, ListenerName.forSecurityProtocol(SecurityProtocol.SASL_SSL),
+      SecurityProtocol.SASL_SSL, ClientInformation.EMPTY, false)
+  }
+
+  private def clusterAllowed(a: AclAuthorizer, principal: KafkaPrincipal, apiKey: ApiKeys, op: AclOperation): Boolean = {
+    val action = new Action(op, new ResourcePattern(CLUSTER, Resource.CLUSTER_NAME, LITERAL), 1, true, true)
+    a.authorize(contextFor(principal, apiKey), Collections.singletonList(action)).get(0) == AuthorizationResult.ALLOWED
+  }
+
+  @Test
+  def testQuotaApiChangesOnlyForAllowedIdentities(): Unit = {
+    val props = TestUtils.createBrokerConfig(0, zkConnect)
+    props.put(AclAuthorizer.SuperUsersProp, "User:superuser;Claim:kafka-admins;User:O=LocalDev,CN=cruise-control")
+    props.put(MultiIdentityAclAuthorizer.QuotaApiChangesAllowedPrincipalsProp,
+      " User:O=LocalDev,CN=cruise-control ; Claim:quota-admins ")
+    val guarded = new MultiIdentityAclAuthorizer
+    guarded.configure(KafkaConfig.fromProps(props).originals)
+    try {
+      val superUser = new KafkaPrincipal("User", "superuser")
+      val cruiseControl = new KafkaPrincipal("User", "O=LocalDev,CN=cruise-control")
+      // AlterClientQuotas: only the allowed identities, super users are refused
+      assertFalse(clusterAllowed(guarded, superUser, ApiKeys.ALTER_CLIENT_QUOTAS, ALTER_CONFIGS))
+      assertTrue(clusterAllowed(guarded, cruiseControl, ApiKeys.ALTER_CLIENT_QUOTAS, ALTER_CONFIGS))
+      assertTrue(clusterAllowed(guarded, token("ops@example.com", "kafka-admins", "quota-admins"), ApiKeys.ALTER_CLIENT_QUOTAS, ALTER_CONFIGS))
+      assertFalse(clusterAllowed(guarded, token("ops2@example.com", "kafka-admins"), ApiKeys.ALTER_CLIENT_QUOTAS, ALTER_CONFIGS))
+      // an allowed identity still needs the permission itself
+      assertFalse(clusterAllowed(guarded, token("x@example.com", "quota-admins"), ApiKeys.ALTER_CLIENT_QUOTAS, ALTER_CONFIGS))
+      // other requests are not affected
+      assertTrue(clusterAllowed(guarded, superUser, ApiKeys.INCREMENTAL_ALTER_CONFIGS, ALTER_CONFIGS))
+      assertTrue(clusterAllowed(guarded, superUser, ApiKeys.DESCRIBE_CLIENT_QUOTAS, DESCRIBE_CONFIGS))
+    } finally {
+      guarded.close()
+    }
+  }
+
+  @Test
+  def testQuotaApiUnrestrictedByDefault(): Unit = {
+    assertTrue(clusterAllowed(authorizer, new KafkaPrincipal("User", "superuser"), ApiKeys.ALTER_CLIENT_QUOTAS, ALTER_CONFIGS))
+  }
+
+  @Test
+  def testInvalidQuotaApiPrincipal(): Unit = {
+    val e = configureWith(Map(MultiIdentityAclAuthorizer.QuotaApiChangesAllowedPrincipalsProp -> "User:a;no-type"))
+    assertTrue(e.exists(_.isInstanceOf[ConfigException]), s"got $e")
   }
 
   @Test

@@ -16,13 +16,15 @@
  */
 package kafka.security.authorizer
 
-import org.apache.kafka.common.acl.{AclBinding, AclBindingFilter}
+import org.apache.kafka.common.acl.{AclBinding, AclBindingFilter, AclOperation}
 import org.apache.kafka.common.config.ConfigException
 import org.apache.kafka.common.errors.PolicyViolationException
+import org.apache.kafka.common.protocol.ApiKeys
+import org.apache.kafka.common.resource.ResourceType
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, MultiIdentityPrincipal}
 import org.apache.kafka.common.security.authenticator.{DefaultSuperUsersValidator, SuperUsersValidationIssue, SuperUsersValidator}
-import org.apache.kafka.common.utils.Utils
-import org.apache.kafka.server.authorizer.{AclCreateResult, AclDeleteResult, AuthorizableRequestContext}
+import org.apache.kafka.common.utils.{SecurityUtils, Utils}
+import org.apache.kafka.server.authorizer.{AclCreateResult, AclDeleteResult, Action, AuthorizableRequestContext, AuthorizationResult}
 
 import java.util
 import java.util.concurrent.{CompletableFuture, CompletionStage}
@@ -53,18 +55,47 @@ import scala.jdk.CollectionConverters._
  * principal, super users included. `describeAcls` and authorization are unaffected. Use this when the ACLs in
  * ZooKeeper are managed from a deployed file (e.g. Cruise Control's ACL sync, which writes ZooKeeper directly).
  * Direct ZooKeeper writes are not blocked by this setting; they need ZooKeeper security.
+ *
+ * With `authorizer.quota.api.changes.allowed.principals` set (`;`-separated, e.g.
+ * `User:O=LocalDev,CN=cruise-control`), client quotas can only be changed through the admin API (`AlterClientQuotas`,
+ * e.g. `kafka-configs.sh --alter --entity-type users`) by those identities — super users included in the refusal.
+ * Use this when the quotas are managed from a deployed file (Cruise Control's quota sync). Not set: unrestricted.
  */
 class MultiIdentityAclAuthorizer extends AclAuthorizer {
   import MultiIdentityAclAuthorizer._
 
   @volatile private var aclApiChangesEnabled = true
+  @volatile private var quotaChangePrincipals: Option[Set[KafkaPrincipal]] = None
 
   override def configure(javaConfigs: util.Map[String, _]): Unit = {
     validateSuperUsers(javaConfigs)
     aclApiChangesEnabled = parseBoolean(javaConfigs, AclApiChangesEnabledProp, default = true)
     if (!aclApiChangesEnabled)
       info(s"$AclApiChangesEnabledProp=false: ACL changes through the admin API (createAcls / deleteAcls) are refused.")
+    quotaChangePrincipals = parsePrincipals(javaConfigs, QuotaApiChangesAllowedPrincipalsProp)
+    quotaChangePrincipals.foreach { allowed =>
+      info(s"Client quota changes through the admin API (AlterClientQuotas) are allowed only for: ${allowed.mkString(", ")}")
+    }
     super.configure(javaConfigs)
+  }
+
+  /**
+   * As [[AclAuthorizer]], except that `AlterClientQuotas` (authorized as ALTER_CONFIGS on the cluster) is denied for
+   * every principal that has no identity in `authorizer.quota.api.changes.allowed.principals`, when that is set.
+   */
+  override def authorize(requestContext: AuthorizableRequestContext, actions: util.List[Action]): util.List[AuthorizationResult] = {
+    val results = super.authorize(requestContext, actions)
+    quotaChangePrincipals match {
+      case Some(allowed) if requestContext != null && requestContext.requestType == ApiKeys.ALTER_CLIENT_QUOTAS.id
+          && !aclPrincipals(requestContext.principal).exists(allowed.contains) =>
+        actions.asScala.zip(results.asScala).map { case (action, result) =>
+          if (action.operation == AclOperation.ALTER_CONFIGS && action.resourcePattern.resourceType == ResourceType.CLUSTER) {
+            warn(s"Refused AlterClientQuotas from ${requester(requestContext)}: not in $QuotaApiChangesAllowedPrincipalsProp")
+            AuthorizationResult.DENIED
+          } else result
+        }.asJava
+      case _ => results
+    }
   }
 
   override def createAcls(requestContext: AuthorizableRequestContext,
@@ -122,6 +153,16 @@ class MultiIdentityAclAuthorizer extends AclAuthorizer {
         errors.map(_.toString).mkString(" | "))
   }
 
+  private def parsePrincipals(configs: util.Map[String, _], name: String): Option[Set[KafkaPrincipal]] =
+    Option(configs.get(name)).map(_.toString.trim).filter(_.nonEmpty).map { value =>
+      value.split(";").map(_.trim).filter(_.nonEmpty).map { entry =>
+        try SecurityUtils.parseKafkaPrincipal(entry)
+        catch {
+          case e: IllegalArgumentException => throw new ConfigException(name, value, s"invalid principal '$entry': ${e.getMessage}")
+        }
+      }.toSet
+    }
+
   private def parseBoolean(configs: util.Map[String, _], name: String, default: Boolean): Boolean =
     Option(configs.get(name)).map(_.toString.trim).filter(_.nonEmpty) match {
       case None => default
@@ -147,6 +188,9 @@ class MultiIdentityAclAuthorizer extends AclAuthorizer {
 object MultiIdentityAclAuthorizer {
   /** Whether ACLs may be created / deleted through the admin API (default true). */
   val AclApiChangesEnabledProp = "authorizer.acl.api.changes.enabled"
+
+  /** Identities allowed to change client quotas through the admin API (`;`-separated); not set = unrestricted. */
+  val QuotaApiChangesAllowedPrincipalsProp = "authorizer.quota.api.changes.allowed.principals"
 
   private[authorizer] val RefusedMessage = "ACL changes through the admin API are disabled on this cluster " +
     s"($AclApiChangesEnabledProp=false); ACLs are managed from the deployed ACL file."
