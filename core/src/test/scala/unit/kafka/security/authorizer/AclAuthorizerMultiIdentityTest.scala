@@ -22,6 +22,7 @@ import org.apache.kafka.common.acl.AclOperation.{DESCRIBE, READ, WRITE}
 import org.apache.kafka.common.acl.AclPermissionType.{ALLOW, DENY}
 import org.apache.kafka.common.acl.{AccessControlEntry, AccessControlEntryFilter, AclBinding, AclBindingFilter, AclOperation}
 import org.apache.kafka.common.config.ConfigException
+import org.apache.kafka.common.errors.PolicyViolationException
 import org.apache.kafka.common.network.{ClientInformation, ListenerName}
 import org.apache.kafka.common.protocol.ApiKeys
 import org.apache.kafka.common.requests.{RequestContext, RequestHeader}
@@ -247,6 +248,66 @@ class AclAuthorizerMultiIdentityTest extends QuorumTestHarness {
   def testUnknownValidatorClass(): Unit = {
     val e = configureWith(Map(SuperUsersValidator.VALIDATOR_CLASS_CONFIG -> "com.example.DoesNotExist"))
     assertTrue(e.exists(_.isInstanceOf[ConfigException]), s"got $e")
+  }
+
+  /** A MultiIdentityAclAuthorizer with ACL changes through the admin API disabled (same ZooKeeper as `authorizer`). */
+  private def lockedAuthorizer(): MultiIdentityAclAuthorizer = {
+    val props = TestUtils.createBrokerConfig(0, zkConnect)
+    props.put(AclAuthorizer.SuperUsersProp, "User:superuser;Claim:kafka-admins")
+    props.put(MultiIdentityAclAuthorizer.AclApiChangesEnabledProp, "false")
+    val a = new MultiIdentityAclAuthorizer
+    a.configure(KafkaConfig.fromProps(props).originals)
+    a
+  }
+
+  @Test
+  def testAclApiChangesRefusedWhenDisabled(): Unit = {
+    // ACL written while changes are allowed (as the deployed file would put it into ZooKeeper)
+    addAcls(topic, ace("Claim:kafka-readers", READ, ALLOW))
+    val locked = lockedAuthorizer()
+    try {
+      TestUtils.waitUntilTrue(() => locked.acls(new AclBindingFilter(topic.toFilter, AccessControlEntryFilter.ANY)).asScala.size == 1,
+        "locked authorizer did not load the ACL")
+
+      // create: refused for every binding, also for a super user (by name or by claim)
+      for (requester <- Seq(adminContext, context(token("ops@example.com", "kafka-admins")))) {
+        val bindings = Seq(new AclBinding(topic, ace("Claim:intruders", READ, ALLOW)),
+          new AclBinding(topic, ace("User:mallory", WRITE, ALLOW))).asJava
+        val results = locked.createAcls(requester, bindings).asScala.map(_.toCompletableFuture.get)
+        assertEquals(2, results.size)
+        results.foreach { r =>
+          assertTrue(r.exception.isPresent && r.exception.get.isInstanceOf[PolicyViolationException], s"got ${r.exception}")
+          assertTrue(r.exception.get.getMessage.contains(MultiIdentityAclAuthorizer.AclApiChangesEnabledProp))
+        }
+      }
+
+      // delete: refused, the ACL stays
+      val filter = new AclBindingFilter(topic.toFilter, AccessControlEntryFilter.ANY)
+      val deleted = locked.deleteAcls(adminContext, Collections.singletonList(filter)).asScala.map(_.toCompletableFuture.get)
+      assertEquals(1, deleted.size)
+      assertTrue(deleted.head.exception.isPresent && deleted.head.exception.get.isInstanceOf[PolicyViolationException])
+
+      // nothing changed in ZooKeeper (seen by the other instance), describe and authorize still work
+      assertEquals(Set(ace("Claim:kafka-readers", READ, ALLOW)), authorizer.acls(filter).asScala.map(_.entry).toSet)
+      assertEquals(Set(ace("Claim:kafka-readers", READ, ALLOW)), locked.acls(filter).asScala.map(_.entry).toSet)
+      assertTrue(locked.authorize(context(token("bob@example.com", "kafka-readers")),
+        Collections.singletonList(new Action(READ, topic, 1, true, true))).get(0) == AuthorizationResult.ALLOWED)
+      assertFalse(locked.authorize(context(token("eve@example.com", "intruders")),
+        Collections.singletonList(new Action(READ, topic, 1, true, true))).get(0) == AuthorizationResult.ALLOWED)
+    } finally {
+      locked.close()
+    }
+  }
+
+  @Test
+  def testAclApiChangesSettingValues(): Unit = {
+    assertEquals(None, configureWith(Map(MultiIdentityAclAuthorizer.AclApiChangesEnabledProp -> "TRUE")))
+    assertEquals(None, configureWith(Map(MultiIdentityAclAuthorizer.AclApiChangesEnabledProp -> " false ")))
+    val e = configureWith(Map(MultiIdentityAclAuthorizer.AclApiChangesEnabledProp -> "yes"))
+    assertTrue(e.exists(_.isInstanceOf[ConfigException]), s"got $e")
+    // default (not set): changes allowed, as before
+    addAcls(topic, ace("User:alice@example.com", WRITE, ALLOW))
+    assertTrue(allowed(new KafkaPrincipal("User", "alice@example.com"), WRITE, topic))
   }
 
   @Test

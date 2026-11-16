@@ -16,12 +16,16 @@
  */
 package kafka.security.authorizer
 
+import org.apache.kafka.common.acl.{AclBinding, AclBindingFilter}
 import org.apache.kafka.common.config.ConfigException
+import org.apache.kafka.common.errors.PolicyViolationException
 import org.apache.kafka.common.security.auth.{KafkaPrincipal, MultiIdentityPrincipal}
 import org.apache.kafka.common.security.authenticator.{DefaultSuperUsersValidator, SuperUsersValidationIssue, SuperUsersValidator}
 import org.apache.kafka.common.utils.Utils
+import org.apache.kafka.server.authorizer.{AclCreateResult, AclDeleteResult, AuthorizableRequestContext}
 
 import java.util
+import java.util.concurrent.{CompletableFuture, CompletionStage}
 import scala.jdk.CollectionConverters._
 
 /**
@@ -43,13 +47,51 @@ import scala.jdk.CollectionConverters._
  *
  * At startup `super.users` is validated by a [[SuperUsersValidator]] (`authorizer.super.users.validation.class`,
  * default [[DefaultSuperUsersValidator]]). Every issue is logged; any ERROR stops the broker from starting.
+ *
+ * With `authorizer.acl.api.changes.enabled=false` (default `true`), ACLs can't be changed through the admin API:
+ * `createAcls` / `deleteAcls` (e.g. `kafka-acls.sh --add/--remove`) fail with a [[PolicyViolationException]] for every
+ * principal, super users included. `describeAcls` and authorization are unaffected. Use this when the ACLs in
+ * ZooKeeper are managed from a deployed file (e.g. Cruise Control's ACL sync, which writes ZooKeeper directly).
+ * Direct ZooKeeper writes are not blocked by this setting; they need ZooKeeper security.
  */
 class MultiIdentityAclAuthorizer extends AclAuthorizer {
+  import MultiIdentityAclAuthorizer._
+
+  @volatile private var aclApiChangesEnabled = true
 
   override def configure(javaConfigs: util.Map[String, _]): Unit = {
     validateSuperUsers(javaConfigs)
+    aclApiChangesEnabled = parseBoolean(javaConfigs, AclApiChangesEnabledProp, default = true)
+    if (!aclApiChangesEnabled)
+      info(s"$AclApiChangesEnabledProp=false: ACL changes through the admin API (createAcls / deleteAcls) are refused.")
     super.configure(javaConfigs)
   }
+
+  override def createAcls(requestContext: AuthorizableRequestContext,
+                          aclBindings: util.List[AclBinding]): util.List[_ <: CompletionStage[AclCreateResult]] = {
+    if (aclApiChangesEnabled)
+      super.createAcls(requestContext, aclBindings)
+    else {
+      warn(s"Refused createAcls for ${aclBindings.size} binding(s) from ${requester(requestContext)}: $AclApiChangesEnabledProp=false")
+      val result = new AclCreateResult(new PolicyViolationException(RefusedMessage))
+      aclBindings.asScala.map(_ => CompletableFuture.completedFuture(result)).asJava
+    }
+  }
+
+  override def deleteAcls(requestContext: AuthorizableRequestContext,
+                          aclBindingFilters: util.List[AclBindingFilter]): util.List[_ <: CompletionStage[AclDeleteResult]] = {
+    if (aclApiChangesEnabled)
+      super.deleteAcls(requestContext, aclBindingFilters)
+    else {
+      warn(s"Refused deleteAcls for ${aclBindingFilters.size} filter(s) from ${requester(requestContext)}: $AclApiChangesEnabledProp=false")
+      val result = new AclDeleteResult(new PolicyViolationException(RefusedMessage))
+      aclBindingFilters.asScala.map(_ => CompletableFuture.completedFuture(result)).asJava
+    }
+  }
+
+  /** The requesting principal for the log; the context is null when the authorizer runs outside a broker. */
+  private def requester(requestContext: AuthorizableRequestContext): String =
+    Option(requestContext).flatMap(c => Option(c.principal)).map(auditPrincipal).getOrElse("an unknown requester")
 
   private def validateSuperUsers(configs: util.Map[String, _]): Unit = {
     val className = Option(configs.get(SuperUsersValidator.VALIDATOR_CLASS_CONFIG)).map(_.toString.trim)
@@ -80,6 +122,14 @@ class MultiIdentityAclAuthorizer extends AclAuthorizer {
         errors.map(_.toString).mkString(" | "))
   }
 
+  private def parseBoolean(configs: util.Map[String, _], name: String, default: Boolean): Boolean =
+    Option(configs.get(name)).map(_.toString.trim).filter(_.nonEmpty) match {
+      case None => default
+      case Some(v) if v.equalsIgnoreCase("true") => true
+      case Some(v) if v.equalsIgnoreCase("false") => false
+      case Some(v) => throw new ConfigException(name, v, "must be true or false")
+    }
+
   override protected[authorizer] def aclPrincipals(sessionPrincipal: KafkaPrincipal): Set[KafkaPrincipal] =
     sessionPrincipal match {
       case p: MultiIdentityPrincipal => p.aclPrincipals().asScala.toSet
@@ -92,4 +142,12 @@ class MultiIdentityAclAuthorizer extends AclAuthorizer {
       case p: MultiIdentityPrincipal => p.describe()
       case p => super.auditPrincipal(p)
     }
+}
+
+object MultiIdentityAclAuthorizer {
+  /** Whether ACLs may be created / deleted through the admin API (default true). */
+  val AclApiChangesEnabledProp = "authorizer.acl.api.changes.enabled"
+
+  private[authorizer] val RefusedMessage = "ACL changes through the admin API are disabled on this cluster " +
+    s"($AclApiChangesEnabledProp=false); ACLs are managed from the deployed ACL file."
 }
