@@ -1,7 +1,7 @@
 # Multi-identity security & identity-based throttling for Apache Kafka 3.9 (fork)
 
 > **This is a fork of [Apache Kafka](https://github.com/apache/kafka) (branch `3.9`), modified by
-> [@wuqingjun](https://github.com/wuqingjun).** It is not an official Apache Kafka release and is not affiliated with or
+> qjwu.** It is not an official Apache Kafka release and is not affiliated with or
 > endorsed by the Apache Software Foundation. Apache, Apache Kafka and Kafka are trademarks of the Apache Software
 > Foundation. Licensed under the Apache License 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) (unchanged).
 > The original Apache Kafka README follows below the line.

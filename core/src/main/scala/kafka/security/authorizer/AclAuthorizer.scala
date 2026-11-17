@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Modified by qjwu (2026): protected extension points aclPrincipals / auditPrincipal, used by MultiIdentityAclAuthorizer.
 package kafka.security.authorizer
 
 import java.{lang, util}

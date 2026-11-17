@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+// Copyright 2026 qjwu. Part of the multi-identity extensions of this fork (see README.md, "Modifications").
 /**
  * Pluggable validation of SAML tokens sent over SASL/OAUTHBEARER.
  * See {@link org.apache.kafka.common.security.oauthbearer.saml.SamlTokenValidator}.
