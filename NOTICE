@@ -21,3 +21,7 @@ Some portions of this file Copyright (c) 2004-2006 Intel Corporation and license
 
 This project contains the following code copied from Apache Hive:
 streams/src/main/java/org/apache/kafka/streams/state/internals/Murmur3.java
+
+This fork includes modifications by qjwu (2026): SAML 2.0 authentication, multi-identity principal,
+claim-based authorization, super.users validation, ACL / quota API guards and identity-based quotas.
+See README.md, "Modifications", for the list of new and changed files.

@@ -1,3 +1,44 @@
+# Multi-identity security & identity-based throttling for Apache Kafka 3.9 (fork)
+
+> **This is a fork of [Apache Kafka](https://github.com/apache/kafka) (branch `3.9`), modified by
+> qjwu.** It is not an official Apache Kafka release and is not affiliated with or
+> endorsed by the Apache Software Foundation. Apache, Apache Kafka and Kafka are trademarks of the Apache Software
+> Foundation. Licensed under the Apache License 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) (unchanged).
+> The original Apache Kafka README follows below the line.
+>
+> Companion project: [Cruise Control fork](https://github.com/wuqingjun/cruise-control) (ACL sync, quota sync).
+> Default branch: `kafka-3.9-multi-identity`. Mode: ZooKeeper.
+
+## Added features
+
+| Feature | What it does | Enable with |
+|---|---|---|
+| **SAML 2.0 authentication** | Clients authenticate with a SAML assertion over SASL/OAUTHBEARER (SASL_SSL). Validation is pluggable: implement `SamlTokenValidator` for your identity provider (issuer, audience, signature, lifetime). The token's subject and claims become one *multi-identity* principal. | `listener.name.<listener>.oauthbearer.sasl.server.callback.handler.class=org.apache.kafka.common.security.oauthbearer.saml.SamlOAuthBearerValidatorCallbackHandler`, `saml.token.validator.class=<your validator>`, options `saml.token.validator.*`; clients: `SamlFileLoginCallbackHandler` (`samlTokenFile`) |
+| **Multi-identity principal** | `MultiIdentityPrincipal` (subject + claims, e.g. `User:alice@example.com`, `Claim:payments-team`) built by `MultiIdentityPrincipalBuilder`; certificate (mTLS) clients keep their DN principal. | `principal.builder.class=org.apache.kafka.common.security.authenticator.MultiIdentityPrincipalBuilder` |
+| **Claim-based authorization** | `MultiIdentityAclAuthorizer`: a request is allowed if any identity has a matching ALLOW ACL and none has a DENY ACL; super users by claim. ACLs, storage and everything else as `AclAuthorizer`. | `authorizer.class.name=kafka.security.authorizer.MultiIdentityAclAuthorizer` |
+| **`super.users` validation** | Startup check of `super.users` (e.g. certificate DN order, unknown types); errors stop the broker. Pluggable `SuperUsersValidator`. | default on with the authorizer; `authorizer.super.users.validation.class` |
+| **ACL changes only from the deployed file** | `createAcls` / `deleteAcls` through the admin API refused for everyone (super users included); ACLs come from the signed file applied by Cruise Control ACL sync. | `authorizer.acl.api.changes.enabled=false` |
+| **Identity-based throttling** | `MultiIdentityQuotaCallback`: produce / fetch / request quotas per identity (`Claim:…`, `User:…`) instead of `client.id`; the highest matching value wins; a claim's budget is shared by its members (per broker); principals without an entry get the default in their own bucket. Kafka's throttling algorithm is unchanged. | `client.quota.callback.class=org.apache.kafka.server.quota.MultiIdentityQuotaCallback` |
+| **Quota changes only from Cruise Control** | `AlterClientQuotas` refused for every principal not listed (super users included). | `authorizer.quota.api.changes.allowed.principals=User:O=...,CN=cruise-control` |
+
+All features are pluggable classes loaded by class name; Kafka's built-in classes keep their behavior.
+
+## Modifications
+
+Notice of changes (Apache License 2.0, section 4(b)), relative to Apache Kafka `3.9` (`ab6e1f1575`):
+
+- **Modified:** `core/src/main/scala/kafka/security/authorizer/AclAuthorizer.scala` — two protected extension points
+  (`aclPrincipals`, `auditPrincipal`) used by `MultiIdentityAclAuthorizer`; no behavior change for `AclAuthorizer`.
+- **New (main):** `clients/.../security/auth/MultiIdentityPrincipal.java`;
+  `clients/.../security/authenticator/{MultiIdentityPrincipalBuilder, SuperUsersValidator, DefaultSuperUsersValidator, SuperUsersValidationIssue}.java`;
+  `clients/.../security/oauthbearer/saml/*` (SAML callback handlers, token, validator interface);
+  `clients/.../server/quota/MultiIdentityQuotaCallback.java`;
+  `core/.../security/authorizer/MultiIdentityAclAuthorizer.scala`.
+- **New (tests):** tests for each of the above, incl. `AclAuthorizerMultiIdentityTest` and
+  `MultiIdentityQuotaCallbackManagerTest` (Kafka's `ClientQuotaManager` with the callback).
+
+---
+
 Apache Kafka
 =================
 See our [web site](https://kafka.apache.org) for details on the project.
