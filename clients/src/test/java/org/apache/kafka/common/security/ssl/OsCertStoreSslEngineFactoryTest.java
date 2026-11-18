@@ -168,10 +168,13 @@ public class OsCertStoreSslEngineFactoryTest {
         return factory;
     }
 
-    /** Runs a TLS handshake in memory; returns the server engine. */
+    private static SSLEngine lastClientEngine;
+
+    /** Runs a TLS handshake in memory; returns the server engine (the client engine is in {@link #lastClientEngine}). */
     private static SSLEngine handshake(OsCertStoreSslEngineFactory client, OsCertStoreSslEngineFactory serverFactory) throws Exception {
         SSLEngine c = client.createClientSslEngine("localhost", 9092, "https");
         SSLEngine s = serverFactory.createServerSslEngine("localhost", 9092);
+        lastClientEngine = c;
         int size = Math.max(c.getSession().getPacketBufferSize(), s.getSession().getPacketBufferSize());
         ByteBuffer cOut = ByteBuffer.allocate(size);
         ByteBuffer sOut = ByteBuffer.allocate(size);
@@ -246,7 +249,12 @@ public class OsCertStoreSslEngineFactoryTest {
     @Test
     public void expiredClientCertificateIsRejectedEvenFromTrustedCa() throws Exception {
         OsCertStoreSslEngineFactory broker = factory(brokerStore());
-        OsCertStoreSslEngineFactory expired = factory(clientStore("expired", "CN=old-app,O=TeamB", "CN=Team B CA,O=TeamB", teamBCaKeys, teamBCa, 30, -1));
+        Map<String, Object> expiredConfigs = clientStore("expired", "CN=old-app,O=TeamB", "CN=Team B CA,O=TeamB", teamBCaKeys, teamBCa, 30, -1);
+        // Our own factory refuses to load an expired chain; simulate a client that sends one anyway.
+        KafkaException refused = assertThrows(KafkaException.class, () -> factory(expiredConfigs));
+        assertTrue(refused.getMessage().contains("is not valid now"), refused.getMessage());
+        expiredConfigs.put(OsCertStoreSslEngineFactory.REQUIRE_FULL_CHAIN_CONFIG, "false");
+        OsCertStoreSslEngineFactory expired = factory(expiredConfigs);
         assertThrows(SSLException.class, () -> handshake(expired, broker));
     }
 
@@ -343,6 +351,80 @@ public class OsCertStoreSslEngineFactoryTest {
         assertTrue(broker.maybeReload());
         assertEquals(2, broker.trustedCas().size());
         assertThrows(SSLException.class, () -> handshake(teamC, broker));
+    }
+
+    /** Broker store whose chain.pem has the given content. */
+    private Map<String, Object> brokerStoreWithChain(String chainPem) throws Exception {
+        Map<String, Object> configs = brokerStore();
+        Path key = Paths.get(configs.get(OsCertStoreSslEngineFactory.KEY_DIR_CONFIG).toString());
+        write(key.resolve(DirectoryCertificateStore.CHAIN_FILE), chainPem);
+        return configs;
+    }
+
+    private void assertChainRefused(String chainPem, String expectedMessage) throws Exception {
+        Map<String, Object> configs = brokerStoreWithChain(chainPem);
+        KafkaException e = assertThrows(KafkaException.class, () -> factory(configs));
+        assertTrue(e.getMessage().contains(expectedMessage), e.getMessage());
+    }
+
+    @Test
+    public void clientReceivesFullChainEndingInTheRootWithItsThumbprint() throws Exception {
+        OsCertStoreSslEngineFactory broker = factory(brokerStore());
+        OsCertStoreSslEngineFactory teamB = factory(clientStore("teamb", "CN=teamb-app,O=TeamB", "CN=Team B CA,O=TeamB", teamBCaKeys, teamBCa, 1, 30));
+        handshake(teamB, broker);
+        Certificate[] received = lastClientEngine.getSession().getPeerCertificates();
+        assertArrayEquals(new Certificate[]{server, intermediate, root}, received);
+        // The client can recognise the root by its SHA-256 thumbprint.
+        assertEquals(CertificateChainValidator.thumbprint(root), CertificateChainValidator.thumbprint((X509Certificate) received[2]));
+        assertEquals(Arrays.asList("leaf", "intermediate", "root"), Arrays.asList(
+            CertificateChainValidator.describe(Arrays.asList(server, intermediate, root)).stream()
+                .map(l -> l.split(" ")[1]).toArray()));
+    }
+
+    @Test
+    public void incompleteOrBrokenChainsAreRefused() throws Exception {
+        assertChainRefused(pem(server), "a full chain is required");
+        assertChainRefused(pem(server, intermediate), "is not a root CA");
+        assertChainRefused(pem(server, root, intermediate), "order the chain");
+        assertChainRefused(pem(intermediate, server, root), "order the chain");
+
+        // An "intermediate" that is not a CA must not sign the leaf.
+        KeyPair fakeKeys = TestSslUtils.generateKeyPair("RSA");
+        X509Certificate fake = TestSslUtils.generateSignedCertificate("CN=Not A CA,O=Test", fakeKeys, 1, 30,
+            "CN=Root CA,O=Test", rootKeys, ALG, false, true, true);
+        KeyPair leafKeys = TestSslUtils.generateKeyPair("RSA");
+        X509Certificate leaf = TestSslUtils.generateSignedCertificate("CN=localhost,O=Test", leafKeys, 1, 30,
+            "CN=Not A CA,O=Test", fakeKeys, ALG, false, true, true);
+        Map<String, Object> configs = brokerStoreWithChain(pem(leaf, fake, root));
+        write(Paths.get(configs.get(OsCertStoreSslEngineFactory.KEY_DIR_CONFIG).toString()).resolve(DirectoryCertificateStore.KEY_FILE),
+            pemKey(leafKeys));
+        KafkaException e = assertThrows(KafkaException.class, () -> factory(configs));
+        assertTrue(e.getMessage().contains("is not a CA"), e.getMessage());
+
+        // A forged intermediate: same name as the real one, different key -> the leaf's signature doesn't verify.
+        KeyPair otherKeys = TestSslUtils.generateKeyPair("RSA");
+        X509Certificate forged = TestSslUtils.generateSignedCertificate("CN=Intermediate CA,O=Test", otherKeys, 1, 30,
+            "CN=Root CA,O=Test", rootKeys, ALG, true, false, false);
+        assertChainRefused(pem(server, forged, root), "does not verify");
+
+        // The check can be turned off (e.g. peers that are configured with the intermediate themselves).
+        Map<String, Object> leafOnly = brokerStoreWithChain(pem(server));
+        leafOnly.put(OsCertStoreSslEngineFactory.REQUIRE_FULL_CHAIN_CONFIG, "false");
+        assertEquals(1, factory(leafOnly).keystore().getCertificateChain("kafka").length);
+    }
+
+    @Test
+    public void brokenChainOnReloadKeepsTheLastGoodOne() throws Exception {
+        Map<String, Object> configs = brokerStore();
+        configs.put(OsCertStoreSslEngineFactory.RELOAD_CHECK_INTERVAL_MS_CONFIG, "1000");
+        MockTime time = new MockTime();
+        OsCertStoreSslEngineFactory broker = new OsCertStoreSslEngineFactory(time);
+        broker.configure(configs);
+        write(Paths.get(configs.get(OsCertStoreSslEngineFactory.KEY_DIR_CONFIG).toString()).resolve(DirectoryCertificateStore.CHAIN_FILE),
+            pem(server));
+        time.sleep(1001);
+        assertFalse(broker.maybeReload());
+        assertEquals(3, broker.keystore().getCertificateChain("kafka").length);
     }
 
     @Test

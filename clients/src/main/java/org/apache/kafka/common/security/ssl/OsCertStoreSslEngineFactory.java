@@ -64,7 +64,10 @@ import javax.net.ssl.X509ExtendedKeyManager;
  *       new content through a new SSL context (so earlier TLS sessions can't be resumed) and every added / removed CA is logged with its SHA-256 fingerprint. A store that can't be loaded
  *       (e.g. a file with too open permissions) is not used; the last good content stays.</li>
  * </ul>
- * Standard settings still used: {@code ssl.protocol}, {@code ssl.provider}, {@code ssl.enabled.protocols},
+ * <p>The own certificate chain must be complete — leaf, intermediate CA(s), root CA, each signed by the next — so that
+ * peers receive the whole chain and can validate it from the root (see {@link CertificateChainValidator}); disable
+ * with {@code ssl.os.cert.store.require.full.chain=false}.
+ * <p>Standard settings still used: {@code ssl.protocol}, {@code ssl.provider}, {@code ssl.enabled.protocols},
  * {@code ssl.cipher.suites}, {@code ssl.client.auth}, {@code ssl.secure.random.implementation},
  * {@code ssl.keymanager.algorithm}, {@code ssl.trustmanager.algorithm}; {@code ssl.keystore.*} and
  * {@code ssl.truststore.*} are ignored.
@@ -78,6 +81,8 @@ public class OsCertStoreSslEngineFactory implements SslEngineFactory {
     public static final String WINDOWS_KEY_ALIAS_CONFIG = PREFIX + "windows.key.alias";
     public static final String PERMISSION_CHECK_CONFIG = PREFIX + "permission.check";
     public static final String RELOAD_CHECK_INTERVAL_MS_CONFIG = PREFIX + "reload.check.interval.ms";
+    /** true (default): refuse an own certificate chain that isn't complete (leaf -> intermediate(s) -> root). */
+    public static final String REQUIRE_FULL_CHAIN_CONFIG = PREFIX + "require.full.chain";
     public static final long DEFAULT_RELOAD_CHECK_INTERVAL_MS = 30_000L;
     private static final String KEY_ALIAS = "kafka";
     private static final Logger log = LoggerFactory.getLogger(OsCertStoreSslEngineFactory.class);
@@ -87,6 +92,7 @@ public class OsCertStoreSslEngineFactory implements SslEngineFactory {
     private Map<String, Object> configs;
     private OsCertificateStore store;
     private long reloadIntervalMs;
+    private boolean requireFullChain;
     private String protocol;
     private String provider;
     private String[] cipherSuites;
@@ -135,6 +141,7 @@ public class OsCertStoreSslEngineFactory implements SslEngineFactory {
         this.configs = Collections.unmodifiableMap(new HashMap<>(configs));
         this.store = createStore(configs);
         this.reloadIntervalMs = parseLong(configs.get(RELOAD_CHECK_INTERVAL_MS_CONFIG), DEFAULT_RELOAD_CHECK_INTERVAL_MS);
+        this.requireFullChain = Boolean.parseBoolean(valueOr(configs.get(REQUIRE_FULL_CHAIN_CONFIG), "true"));
         this.protocol = (String) configs.get(SslConfigs.SSL_PROTOCOL_CONFIG);
         this.provider = (String) configs.get(SslConfigs.SSL_PROVIDER_CONFIG);
         List<String> ciphers = (List<String>) configs.get(SslConfigs.SSL_CIPHER_SUITES_CONFIG);
@@ -155,6 +162,8 @@ public class OsCertStoreSslEngineFactory implements SslEngineFactory {
                     + " (chain of " + loaded.material.certificateChain().size() + ")" : ", no own certificate");
             for (OsCertificateStore.TrustedCa ca : loaded.material.trustedCas())
                 log.info("Trusted CA: {} sha256={}", ca, ca.fingerprint());
+            for (String line : CertificateChainValidator.describe(loaded.material.certificateChain()))
+                log.info("Own certificate chain sent to peers: {}", line);
         } catch (IOException | GeneralSecurityException e) {
             throw new KafkaException("Failed to load the certificate store " + store.describe() + ": " + e.getMessage(), e);
         }
@@ -197,6 +206,8 @@ public class OsCertStoreSslEngineFactory implements SslEngineFactory {
 
     private Loaded load() throws IOException, GeneralSecurityException {
         OsCertificateStore.Material material = store.load();
+        if (material.privateKey() != null && requireFullChain)
+            CertificateChainValidator.validateFullChain(material.certificateChain());
         MultiCaTrustManager trust = new MultiCaTrustManager(material.trustedCas(), tmfAlgorithm);
         KeyStore truststore = KeyStore.getInstance("PKCS12");
         truststore.load(null, null);
@@ -287,8 +298,8 @@ public class OsCertStoreSslEngineFactory implements SslEngineFactory {
                 log.info("Certificate store {}: trusted CA REMOVED {} sha256={}", store.describe(), ca, fp);
         });
         if (!before.certificateChain().equals(after.certificateChain()) || !Objects.equals(before.privateKey(), after.privateKey()))
-            log.info("Certificate store {}: own certificate changed to {} (chain of {})", store.describe(),
-                after.certificateChain().isEmpty() ? "(none)" : subject(after.certificateChain().get(0)), after.certificateChain().size());
+            CertificateChainValidator.describe(after.certificateChain()).forEach(line ->
+                log.info("Certificate store {}: own certificate chain changed: {}", store.describe(), line));
         log.info("Certificate store {} reloaded: {} trusted CA(s)", store.describe(), after.trustedCas().size());
     }
 
