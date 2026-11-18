@@ -20,6 +20,7 @@
 | **ACL changes only from the deployed file** | `createAcls` / `deleteAcls` through the admin API refused for everyone (super users included); ACLs come from the signed file applied by Cruise Control ACL sync. | `authorizer.acl.api.changes.enabled=false` |
 | **Identity-based throttling** | `MultiIdentityQuotaCallback`: produce / fetch / request quotas per identity (`Claim:…`, `User:…`) instead of `client.id`; the highest matching value wins; a claim's budget is shared by its members (per broker); principals without an entry get the default in their own bucket. Kafka's throttling algorithm is unchanged. | `client.quota.callback.class=org.apache.kafka.server.quota.MultiIdentityQuotaCallback` |
 | **Quota changes only from Cruise Control** | `AlterClientQuotas` refused for every principal not listed (super users included). | `authorizer.quota.api.changes.allowed.principals=User:O=...,CN=cruise-control` |
+| **OS certificate store (no keystore passwords)** | `OsCertStoreSslEngineFactory` takes the trusted CAs and the broker's certificate chain + private key from a store protected by the operating system instead of password-protected keystore / truststore files: a folder of PEM files that must be owned by the Kafka user and closed to group / others (no symlinks; meant to be guarded further by SELinux / AppArmor and audited by `auditd`), or the Windows certificate store (`Windows-ROOT` / `Windows-MY`; **not tested yet**). Clients with certificates from **different CAs**: each CA in the store is tried with full PKIX validation, the first that validates the chain accepts the client. The broker's own chain must be complete (leaf → intermediate(s) → root), so clients receive the whole chain; it is logged with SHA-256 thumbprints. Store changes (CA added / removed, new certificate) are picked up without restart; a store that fails its checks is not used and the last good one stays. | `ssl.engine.factory.class=org.apache.kafka.common.security.ssl.OsCertStoreSslEngineFactory`, `ssl.os.cert.store.trust.dir=<folder of CA .pem/.crt>`, `ssl.os.cert.store.key.dir=<folder with chain.pem + key.pem (PKCS#8)>`; options `ssl.os.cert.store.type` (`DIRECTORY` / `WINDOWS`), `.windows.trust.store`, `.windows.key.alias`, `.permission.check`, `.reload.check.interval.ms` (30000), `.require.full.chain` (true) |
 
 All features are pluggable classes loaded by class name; Kafka's built-in classes keep their behavior.
 
@@ -33,9 +34,10 @@ Notice of changes (Apache License 2.0, section 4(b)), relative to Apache Kafka `
   `clients/.../security/authenticator/{MultiIdentityPrincipalBuilder, SuperUsersValidator, DefaultSuperUsersValidator, SuperUsersValidationIssue}.java`;
   `clients/.../security/oauthbearer/saml/*` (SAML callback handlers, token, validator interface);
   `clients/.../server/quota/MultiIdentityQuotaCallback.java`;
+  `clients/.../security/ssl/{OsCertStoreSslEngineFactory, OsCertificateStore, DirectoryCertificateStore, WindowsCertificateStore, MultiCaTrustManager, CertificateChainValidator}.java`;
   `core/.../security/authorizer/MultiIdentityAclAuthorizer.scala`.
 - **New (tests):** tests for each of the above, incl. `AclAuthorizerMultiIdentityTest` and
-  `MultiIdentityQuotaCallbackManagerTest` (Kafka's `ClientQuotaManager` with the callback).
+  `MultiIdentityQuotaCallbackManagerTest` (Kafka's `ClientQuotaManager` with the callback), `OsCertStoreSslEngineFactoryTest`.
 
 ---
 
