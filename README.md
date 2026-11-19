@@ -24,6 +24,16 @@
 
 All features are pluggable classes loaded by class name; Kafka's built-in classes keep their behavior.
 
+### Clients: verify the broker by its root CA thumbprint
+
+Because brokers using the OS certificate store always send their full chain (leaf → intermediate(s) → root), a client
+doesn't need a CA certificate file: it can pin the **SHA-256 thumbprint of the root CA**, check it on the root it
+receives, and let normal chain validation do the rest (root validates intermediate, intermediate validates leaf). For
+[librdkafka](https://github.com/confluentinc/librdkafka)-based clients this needs no library change — only its
+existing `ssl.certificate.verify_cb`. Example, explanation and test results:
+[examples/librdkafka/](examples/librdkafka/README.md). The thumbprint to pin is in the broker's startup log
+(`Own certificate chain sent to peers: [2] root … sha256=…`).
+
 ## Modifications
 
 Notice of changes (Apache License 2.0, section 4(b)), relative to Apache Kafka `3.9` (`ab6e1f1575`):
@@ -36,6 +46,7 @@ Notice of changes (Apache License 2.0, section 4(b)), relative to Apache Kafka `
   `clients/.../server/quota/MultiIdentityQuotaCallback.java`;
   `clients/.../security/ssl/{OsCertStoreSslEngineFactory, OsCertificateStore, DirectoryCertificateStore, WindowsCertificateStore, MultiCaTrustManager, CertificateChainValidator}.java`;
   `core/.../security/authorizer/MultiIdentityAclAuthorizer.scala`.
+- **New (examples):** `examples/librdkafka/` (C example for librdkafka clients: root CA thumbprint pinning).
 - **New (tests):** tests for each of the above, incl. `AclAuthorizerMultiIdentityTest` and
   `MultiIdentityQuotaCallbackManagerTest` (Kafka's `ClientQuotaManager` with the callback), `OsCertStoreSslEngineFactoryTest`.
 
