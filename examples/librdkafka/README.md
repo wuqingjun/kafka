@@ -69,6 +69,24 @@ openssl s_client -connect broker1:9093 -showcerts </dev/null | grep -E '^ [0-9] 
 openssl x509 -in root-ca.crt -noout -fingerprint -sha256
 ```
 
+## Getting the thumbprints from Cruise Control
+
+The companion [Cruise Control fork](https://github.com/wuqingjun/cruise-control) publishes the thumbprints to pin:
+`GET /kafkacruisecontrol/root_ca?json=true` returns the configured list (`root.ca.thumbprints`) — old **and** new root
+during a root CA rotation — and checks it against what every broker actually sends (`consistent`, per-broker chain,
+`IN_USE` / `NOT_IN_USE` per thumbprint). Fetch it over **HTTPS** with a certificate from a CA the client already trusts,
+or let a pipeline fetch, review and distribute it:
+
+```sh
+PINS=$(curl -s --cacert corporate-ca.crt 'https://cruise-control:9090/kafkacruisecontrol/root_ca?json=true' \
+       | jq -r '[.rootCaThumbprints[].sha256] | join(",")')
+./root_ca_thumbprint -b broker1:9093 -t test -s "$PINS" -X security.protocol=ssl …
+```
+
+Tested through a root CA rotation on the local cluster: with the list from Cruise Control the client connected while
+broker 1 still sent the old root and broker 2 already the new one; a client pinning only the old root was refused by
+broker 2.
+
 ## Build and run
 
 ```sh
