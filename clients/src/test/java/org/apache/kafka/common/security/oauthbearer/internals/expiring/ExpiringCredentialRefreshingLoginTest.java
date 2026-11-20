@@ -772,4 +772,46 @@ public class ExpiringCredentialRefreshingLoginTest {
         return new ExpiringCredentialRefreshConfig(new ConfigDef().withClientSaslSupport().parse(configs),
                 clientReloginAllowedBeforeLogout);
     }
+
+    /** Time whose sleep(ms) also jumps the wall clock by {@code suspendMs} once, like a system suspend during the sleep. */
+    private static final class SuspendingTime extends MockTime {
+        private long suspendMs;
+
+        SuspendingTime(long suspendMs) {
+            super(0, 1_000_000L, 0);
+            this.suspendMs = suspendMs;
+        }
+
+        @Override
+        public void sleep(long ms) {
+            super.sleep(ms);
+            if (suspendMs > 0) {
+                super.sleep(suspendMs); // wall clock jumps; the sleep itself returned after only `ms`
+                suspendMs = 0;
+            }
+        }
+    }
+
+    @Test
+    public void testWaitForRefreshFollowsTheWallClockAcrossASuspend() {
+        long chunk = ExpiringCredentialRefreshingLogin.MAX_REFRESH_WAIT_CHUNK_MS;
+        // Refresh due in 1 hour; the machine is suspended 2 hours during the first sleep.
+        SuspendingTime time = new SuspendingTime(2 * 3600 * 1000L);
+        long target = time.milliseconds() + 3600 * 1000L;
+        int sleeps = ExpiringCredentialRefreshingLogin.sleepUntilWallClock(time, target, chunk, "test");
+        assertEquals(1, sleeps, "refresh right after the resume, not after another hour");
+        assertTrue(time.milliseconds() >= target);
+    }
+
+    @Test
+    public void testWaitForRefreshWithoutSuspendSleepsUntilTheTarget() {
+        long chunk = ExpiringCredentialRefreshingLogin.MAX_REFRESH_WAIT_CHUNK_MS;
+        MockTime time = new MockTime(0, 1_000_000L, 0);
+        long start = time.milliseconds();
+        int sleeps = ExpiringCredentialRefreshingLogin.sleepUntilWallClock(time, start + 95_000, chunk, "test");
+        assertEquals(4, sleeps); // 30 + 30 + 30 + 5 s
+        assertEquals(start + 95_000, time.milliseconds());
+        assertEquals(0, ExpiringCredentialRefreshingLogin.sleepUntilWallClock(time, start, chunk, "test"),
+                "target in the past: no sleep");
+    }
 }

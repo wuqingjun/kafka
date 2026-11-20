@@ -91,7 +91,10 @@ public abstract class ExpiringCredentialRefreshingLogin implements AutoCloseable
                 }
                 log.info("[Principal={}]: Expiring credential re-login sleeping until: {}", principalLogText(),
                         new Date(nextRefreshMs));
-                time.sleep(nextRefreshMs - nowMs);
+                // Wait until the refresh time on the WALL clock: Thread.sleep counts monotonic time, which doesn't
+                // advance while the machine is suspended (laptop sleep, paused VM), so one long sleep would refresh
+                // late by the suspended time — with an expired credential in the meantime.
+                sleepUntilWallClock(time, nextRefreshMs, MAX_REFRESH_WAIT_CHUNK_MS, principalLogText());
                 if (Thread.currentThread().isInterrupted()) {
                     log.info("[Principal={}]: Expiring credential re-login thread has been interrupted and will exit.",
                             principalLogText());
@@ -132,6 +135,10 @@ public abstract class ExpiringCredentialRefreshingLogin implements AutoCloseable
 
     private static final Logger log = LoggerFactory.getLogger(ExpiringCredentialRefreshingLogin.class);
     private static final long DELAY_SECONDS_BEFORE_NEXT_RETRY_WHEN_RELOGIN_FAILS = 10L;
+    // Longest single sleep while waiting for the refresh time (see sleepUntilWallClock)
+    static final long MAX_REFRESH_WAIT_CHUNK_MS = 30 * 1000L;
+    // A sleep that took this much longer on the wall clock than requested indicates a system suspend
+    private static final long SUSPEND_DETECTION_SLACK_MS = 60 * 1000L;
     private static final Random RNG = new Random();
     private final Time time;
     private Thread refresherThread;
@@ -437,6 +444,32 @@ public abstract class ExpiringCredentialRefreshingLogin implements AutoCloseable
 
     private long currentMs() {
         return time.milliseconds();
+    }
+
+    /**
+     * Sleep until the wall clock ({@link Time#milliseconds()}) reaches {@code targetMs}, in sleeps of at most
+     * {@code maxChunkMs}. A single long {@link Time#sleep(long)} measures monotonic time, which does not advance
+     * while the machine is suspended, so after a suspend it would return late by the suspended time; re-checking the
+     * wall clock after each chunk returns at most {@code maxChunkMs} after the machine resumes. Returns early if the
+     * thread is interrupted (the caller checks the interrupt flag).
+     *
+     * @return the number of sleeps (for tests)
+     */
+    static int sleepUntilWallClock(Time time, long targetMs, long maxChunkMs, String principalLogText) {
+        int sleeps = 0;
+        while (!Thread.currentThread().isInterrupted()) {
+            long nowMs = time.milliseconds();
+            if (nowMs >= targetMs)
+                return sleeps;
+            long chunkMs = Math.min(targetMs - nowMs, maxChunkMs);
+            time.sleep(chunkMs);
+            sleeps++;
+            long elapsedMs = time.milliseconds() - nowMs;
+            if (elapsedMs > chunkMs + SUSPEND_DETECTION_SLACK_MS)
+                log.info("[Principal={}]: Wall clock advanced {} ms during a {} ms sleep (system suspended or paused?); "
+                        + "re-checking the credential refresh time", principalLogText, elapsedMs, chunkMs);
+        }
+        return sleeps;
     }
 
     private boolean isLogoutRequiredBeforeLoggingBackIn() {
