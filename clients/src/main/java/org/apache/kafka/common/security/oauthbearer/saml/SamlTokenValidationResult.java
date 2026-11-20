@@ -33,8 +33,9 @@ import java.util.OptionalLong;
  *   <li>{@link #subject()} becomes the principal name (used for quotas, logs and audit).</li>
  *   <li>{@link #claims()} are the identities checked against ACLs ({@code Claim:<value>}); access is granted if
  *       any claim is allowed and none is denied.</li>
- *   <li>{@link #expiresAtMs()}, if present, is when the token expires; with
- *       {@code connections.max.reauth.ms} set, the broker makes the client re-authenticate by then.</li>
+ *   <li>{@link #expiresAtMs()}, if present, is when the token expires: an expired token is rejected, and Kafka ends
+ *       the session at that time unless the client re-authenticates (on the same connection, with a fresh token)
+ *       before — whether or not {@code connections.max.reauth.ms} is set.</li>
  * </ul>
  */
 public final class SamlTokenValidationResult {

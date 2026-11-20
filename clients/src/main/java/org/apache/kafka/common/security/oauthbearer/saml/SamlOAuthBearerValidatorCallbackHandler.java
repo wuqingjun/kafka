@@ -56,8 +56,13 @@ import javax.security.auth.login.AppConfigurationEntry;
  * saml.token.validator.class=com.example.MySamlTokenValidator
  * saml.token.validator.&lt;name&gt;=&lt;value&gt;          # passed to the validator, prefix removed
  * saml.token.default.lifetime.ms=3600000             # optional, for tokens without an expiry
- * connections.max.reauth.ms=3600000                  # recommended: enforce token expiry on open connections
+ * connections.max.reauth.ms=3600000                  # optional: also cap sessions independently of token expiry
  * </pre>
+ * <p>
+ * Session lifetime: Kafka ends an OAUTHBEARER session when the token expires (the lifetime returned here), whether
+ * or not {@code connections.max.reauth.ms} is set; Kafka clients (2.2+) re-authenticate on the open connection with a
+ * fresh token before then (see {@link SamlFileLoginCallbackHandler}). {@code connections.max.reauth.ms} only shortens
+ * sessions further.
  * The {@code saml.token.*} settings are read from the top level of the broker configuration (not listener-prefixed).
  * <p>
  * Invalid tokens: the validator's reason is logged at WARN on the broker; the client only receives
