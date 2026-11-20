@@ -1562,6 +1562,7 @@ public abstract class AbstractCoordinator implements Closeable {
             } catch (AuthenticationException e) {
                 log.error("An authentication error occurred in the heartbeat thread", e);
                 this.failed.set(e);
+                requestRejoin("authentication error in heartbeat thread");
             } catch (GroupAuthorizationException e) {
                 log.error("A group authorization error occurred in the heartbeat thread", e);
                 this.failed.set(e);
