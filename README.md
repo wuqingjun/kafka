@@ -46,7 +46,7 @@ Notice of changes (Apache License 2.0, section 4(b)), relative to Apache Kafka `
   `clients/.../server/quota/MultiIdentityQuotaCallback.java`;
   `clients/.../security/ssl/{OsCertStoreSslEngineFactory, OsCertificateStore, DirectoryCertificateStore, WindowsCertificateStore, MultiCaTrustManager, CertificateChainValidator}.java`;
   `core/.../security/authorizer/MultiIdentityAclAuthorizer.scala`.
-- **New (examples):** `examples/librdkafka/` (C example for librdkafka clients: root CA thumbprint pinning).
+- **New (examples):** `examples/librdkafka/` (C examples for librdkafka clients: root CA thumbprint pinning; SAML token over OAUTHBEARER with refresh and re-authentication).
 - **New (tests):** tests for each of the above, incl. `AclAuthorizerMultiIdentityTest` and
   `MultiIdentityQuotaCallbackManagerTest` (Kafka's `ClientQuotaManager` with the callback), `OsCertStoreSslEngineFactoryTest`.
 

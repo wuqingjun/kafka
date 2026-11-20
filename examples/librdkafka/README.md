@@ -1,3 +1,10 @@
+# librdkafka client examples
+
+- [Root CA thumbprint pinning](#librdkafka-clients-verify-the-broker-by-its-root-ca-thumbprint-no-ca-file):
+  [root_ca_thumbprint.c](root_ca_thumbprint.c)
+- [SAML token over OAUTHBEARER, refreshed without dropping connections](#saml-token-over-oauthbearer-refreshed-without-dropping-connections):
+  [saml_oauthbearer.c](saml_oauthbearer.c)
+
 # librdkafka clients: verify the broker by its root CA thumbprint (no CA file)
 
 Example: [root_ca_thumbprint.c](root_ca_thumbprint.c) — a C producer using
@@ -117,3 +124,66 @@ brokers send `broker → Kafka Intermediate CA → Local Kafka CA`) and against 
 | Leaf only (no intermediate, no root) | refused: top of the chain is not a pinned root |
 | Real chain, hostname not in the certificate | refused at depth 0: "hostname mismatch" |
 | Invalid thumbprint string | rejected at startup |
+
+# SAML token over OAUTHBEARER, refreshed without dropping connections
+
+Example: [saml_oauthbearer.c](saml_oauthbearer.c) — a producer authenticating with a SAML token (this fork's
+`SamlOAuthBearerValidatorCallbackHandler` validates it on the broker), using librdkafka **as is**.
+
+## Two layers
+
+| Layer | Who | How |
+|---|---|---|
+| Getting a new SAML assertion from the identity provider | **not Kafka** (SAML has no refresh token) | an agent / sidecar writes it to a file (STS / WS-Trust, ECP, Kerberos, IdP service accounts…), or the callback calls the IdP |
+| Using it without dropping connections | **librdkafka** | `oauthbearer_token_refresh_cb` at 80 % of the remaining lifetime; KIP-368 re-authentication of every open connection (librdkafka ≥ 2.2.0) before the broker's session lifetime (= token expiry) ends |
+
+The broker ends a session at the token's expiry unless the client re-authenticates on the open connection with a fresh
+token (Kafka's behavior for OAUTHBEARER, with or without `connections.max.reauth.ms`). Certificates differ: a TLS
+session is checked only at the handshake.
+
+## The callback
+
+```c
+static void refresh_cb(rd_kafka_t *rk, const char *oauthbearer_config, void *opaque) {
+        char *token = read_token(token_file, ...);              /* base64 SAML assertion, whitespace removed */
+        long long expiry = earliest_not_on_or_after(token);     /* the token's REAL expiry, epoch ms */
+        if (expiry <= now_ms)                                   /* already expired: don't use it */
+                return rd_kafka_oauthbearer_set_token_failure(rk, "token expired");   /* retried in 10 s */
+        rd_kafka_oauthbearer_set_token(rk, token, expiry, "saml-token-holder", NULL, 0, errstr, sizeof(errstr));
+}
+rd_kafka_conf_set_oauthbearer_token_refresh_cb(conf, refresh_cb);
+```
+
+**Pass the token's real expiry** (earliest `NotOnOrAfter` of the assertion), not "now + 1 hour": librdkafka schedules
+the next refresh — and the connections their re-authentication — from it. A token read from a file that is already
+20 minutes old has only 40 minutes left; with a wrong lifetime the refresh comes too late and re-authentication fails
+with an expired token. The expiry is read with a plain text scan (no XML parser, no trust decision — the broker
+validates the token).
+
+Bindings expose the same callback: confluent-kafka-python `oauth_cb` (returns token and expiry), Go
+`OAuthBearerTokenRefresh` event + `SetOAuthBearerToken`, .NET `SetOAuthBearerTokenRefreshHandler`.
+
+## Build and run
+
+```sh
+cc saml_oauthbearer.c -o saml_oauthbearer $(pkg-config --cflags --libs rdkafka libcrypto)
+./saml_oauthbearer -b broker1:9094 -t test -f /run/saml/token.b64 -r 2 -d 600 \
+  -X security.protocol=sasl_ssl -X ssl.ca.location=root-ca.crt
+```
+
+## Tested
+
+librdkafka v2.16.0, against this fork's 5-broker bake cluster (SASL_SSL, SAML validator), tokens valid **4 minutes**,
+the file rewritten every minute, 9 minutes at 2 msg/s, `debug=security,broker`:
+
+| Time | Event |
+|---|---|
+| 12:55:29 | refresh #1: token read, expires in 232 s; each broker returned "session lifetime 231 s" |
+| 12:58:35 | refresh #2 (80 % of the remaining lifetime): new token, 227 s |
+| 12:58:57–58 | all 5 broker connections re-authenticated with it ("REAUTH") — no disconnect |
+| 13:01:37 / 13:02:01 | refresh #3 / all 5 connections re-authenticated again |
+| result | **1071 / 1071 delivered, 0 authentication failures, 0 disconnects** |
+
+The Java client behaves the same (KIP-255 refresh + KIP-368 re-authentication); verified with
+`SamlFileLoginCallbackHandler`, which reads the same `NotOnOrAfter` since this change.
+
